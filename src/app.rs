@@ -34,7 +34,9 @@ pub(crate) struct ZapretHubApp {
     pending_action: Option<PendingAction>,
     tg_proxy_task: Option<PendingTelegramProxyTask>,
     tg_proxy_status: Option<TelegramProxyUpdateStatus>,
+    tg_proxy_check_error: Option<String>,
     status_monitor: StatusMonitor,
+    repaint_ctx: egui::Context,
     close_after_stop: bool,
     app_config: AppConfig,
     launch_mode: LaunchMode,
@@ -120,7 +122,9 @@ impl ZapretHubApp {
             pending_action: None,
             tg_proxy_task: None,
             tg_proxy_status: None,
+            tg_proxy_check_error: None,
             status_monitor,
+            repaint_ctx: cc.egui_ctx.clone(),
             close_after_stop: false,
             app_config,
             launch_mode,
@@ -218,12 +222,15 @@ impl ZapretHubApp {
         }
 
         let bundle_path = self.bundle_path.clone();
+        let repaint_ctx = self.repaint_ctx.clone();
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
             let result = check_tg_proxy_update(&bundle_path).map(TelegramProxyTaskResult::Checked);
             let _ = sender.send(result);
+            repaint_ctx.request_repaint();
         });
 
+        self.tg_proxy_check_error = None;
         self.tg_proxy_task = Some(PendingTelegramProxyTask {
             task: TelegramProxyTask::Check,
             receiver,
@@ -236,7 +243,12 @@ impl ZapretHubApp {
         }
 
         let Some(status) = self.tg_proxy_status.clone() else {
-            self.last_message = "Сначала дождитесь проверки обновления Telegram proxy.".to_owned();
+            self.last_message = if self.tg_proxy_check_error.is_some() {
+                "Проверка обновлений Telegram proxy завершилась ошибкой. Нажмите «Повторить проверку»."
+                    .to_owned()
+            } else {
+                "Сначала дождитесь проверки обновления Telegram proxy.".to_owned()
+            };
             return;
         };
 
@@ -248,11 +260,13 @@ impl ZapretHubApp {
         let release = status.latest;
         let install_release = release.clone();
         let bundle_path = self.bundle_path.clone();
+        let repaint_ctx = self.repaint_ctx.clone();
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
             let result = install_tg_proxy_update(&bundle_path, &install_release)
                 .map(TelegramProxyTaskResult::Installed);
             let _ = sender.send(result);
+            repaint_ctx.request_repaint();
         });
 
         self.last_message = format!("Обновляю Telegram WS proxy до {}.", release.tag);
@@ -330,6 +344,7 @@ impl ZapretHubApp {
                     match result {
                         Ok(TelegramProxyTaskResult::Checked(status)) => {
                             self.tg_proxy_status = Some(status);
+                            self.tg_proxy_check_error = None;
                         }
                         Ok(TelegramProxyTaskResult::Installed(message)) => {
                             self.last_message = message;
@@ -338,7 +353,8 @@ impl ZapretHubApp {
                             self.start_tg_proxy_check();
                         }
                         Err(error) => {
-                            self.last_message = match task {
+                            let was_check = matches!(task, TelegramProxyTask::Check);
+                            let message = match task {
                                 TelegramProxyTask::Check => {
                                     format!("Не удалось проверить обновление Telegram proxy: {error}")
                                 }
@@ -346,6 +362,10 @@ impl ZapretHubApp {
                                     format!("Не удалось обновить Telegram proxy: {error}")
                                 }
                             };
+                            if was_check {
+                                self.tg_proxy_check_error = Some(error.to_string());
+                            }
+                            self.last_message = message;
                         }
                     }
                 }
@@ -1064,11 +1084,26 @@ impl ZapretHubApp {
                         ui.spinner();
                         ui.label("Проверяю обновления Telegram proxy.");
                     });
+                } else if let Some(error) = self.tg_proxy_check_error.clone() {
+                    ui.label(
+                        RichText::new("Не удалось проверить обновления Telegram proxy.")
+                            .color(Color32::from_rgb(198, 120, 0)),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(error).color(Color32::from_gray(120)));
+                    ui.add_space(8.0);
+                    if ui.button("Повторить проверку").clicked() {
+                        self.start_tg_proxy_check();
+                    }
                 } else {
                     ui.label(
-                        RichText::new("Проверка обновлений Telegram proxy ещё не завершилась.")
+                        RichText::new("Проверка обновлений Telegram proxy ещё не запускалась.")
                             .color(Color32::from_gray(120)),
                     );
+                    ui.add_space(8.0);
+                    if ui.button("Проверить Telegram proxy").clicked() {
+                        self.start_tg_proxy_check();
+                    }
                 }
             },
         );
