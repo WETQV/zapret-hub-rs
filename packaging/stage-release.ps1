@@ -24,6 +24,7 @@ $tgProxyReleaseApi = "https://api.github.com/repos/Flowseal/tg-ws-proxy/releases
 $tgProxyAssetName = "TgWsProxy_windows.exe"
 $tgProxyVersionFileName = "TgWsProxy_windows.version.json"
 $bundleVersionFileName = "ZapretBundle.version.json"
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $telegramProxyScript = @"
 @echo off
 chcp 65001 > nul
@@ -124,7 +125,7 @@ function Update-StagedTelegramProxy {
     [System.IO.File]::WriteAllText(
         (Join-Path $BundleRoot $tgProxyVersionFileName),
         $versionInfo,
-        [System.Text.Encoding]::UTF8
+        $utf8NoBom
     )
 }
 
@@ -148,7 +149,7 @@ function Write-BundleVersionMetadata {
     [System.IO.File]::WriteAllText(
         (Join-Path $BundleRoot $bundleVersionFileName),
         $bundleInfo,
-        [System.Text.Encoding]::UTF8
+        $utf8NoBom
     )
 }
 

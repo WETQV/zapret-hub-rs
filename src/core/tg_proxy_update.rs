@@ -140,8 +140,10 @@ fn read_installed_version(bundle_path: &Path) -> Result<Option<InstalledTelegram
 
     let content = fs::read_to_string(&version_path)
         .with_context(|| format!("failed to read {}", version_path.display()))?;
-    let version = serde_json::from_str(&content)
-        .with_context(|| format!("failed to parse {}", version_path.display()))?;
+    let version = match serde_json::from_str(content.trim_start_matches('\u{feff}')) {
+        Ok(version) => version,
+        Err(_) => return Ok(None),
+    };
 
     Ok(Some(version))
 }
@@ -225,12 +227,45 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn read_installed_version_accepts_utf8_bom() -> Result<()> {
+        let bundle_path = temp_bundle_path();
+        let _cleanup = TempBundleCleanup(bundle_path.clone());
+
+        fs::create_dir_all(&bundle_path)?;
+        fs::write(
+            version_file_path(&bundle_path),
+            "\u{feff}{\"tag\":\"v1.6.0\",\"release_url\":\"https://example.test/release\",\"asset_url\":\"https://example.test/proxy.exe\",\"digest\":null}",
+        )?;
+
+        let version = read_installed_version(&bundle_path)?.expect("version parses");
+        assert_eq!(version.tag, "v1.6.0");
+
+        Ok(())
+    }
+
+    #[test]
+    fn read_installed_version_ignores_invalid_sidecar() -> Result<()> {
+        let bundle_path = temp_bundle_path();
+        let _cleanup = TempBundleCleanup(bundle_path.clone());
+
+        fs::create_dir_all(&bundle_path)?;
+        fs::write(version_file_path(&bundle_path), b"not json")?;
+
+        assert!(read_installed_version(&bundle_path)?.is_none());
+
+        Ok(())
+    }
+
     fn temp_bundle_path() -> PathBuf {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time is after unix epoch")
-            .as_millis();
-        env::temp_dir().join(format!("zapret-hub-tg-proxy-update-test-{stamp}"))
+            .as_nanos();
+        let process_id = std::process::id();
+        env::temp_dir().join(format!(
+            "zapret-hub-tg-proxy-update-test-{process_id}-{stamp}"
+        ))
     }
 
     struct TempBundleCleanup(PathBuf);
