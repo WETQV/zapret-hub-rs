@@ -43,6 +43,11 @@ fn try_compile_windows_resources() -> Result<(), Box<dyn std::error::Error>> {
     let build_date = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let built_by = resolve_build_author();
     let numeric_version = encode_version(&package_version);
+    let requested_execution_level = if cfg!(debug_assertions) {
+        "asInvoker"
+    } else {
+        "requireAdministrator"
+    };
 
     let mut resource = WindowsResource::new();
 
@@ -60,17 +65,19 @@ fn try_compile_windows_resources() -> Result<(), Box<dyn std::error::Error>> {
         .set("InternalName", "zapret-hub-rs.exe")
         .set("LegalCopyright", "Copyright (c) 2026 WETQV")
         .set_manifest(
-            r#"
+            &format!(
+                r#"
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
-        <requestedExecutionLevel level="requireAdministrator" uiAccess="false" />
+        <requestedExecutionLevel level="{requested_execution_level}" uiAccess="false" />
       </requestedPrivileges>
     </security>
   </trustInfo>
 </assembly>
 "#,
+            ),
         )
         .set_version_info(VersionInfo::PRODUCTVERSION, numeric_version)
         .set_version_info(VersionInfo::FILEVERSION, numeric_version);

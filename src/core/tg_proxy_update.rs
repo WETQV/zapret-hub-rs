@@ -185,3 +185,59 @@ fn http_client() -> Result<Client> {
         .build()
         .context("failed to build HTTP client")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    #[ignore = "hits GitHub and downloads the live TgWsProxy_windows.exe asset"]
+    fn live_check_and_install_update_replaces_proxy() -> Result<()> {
+        let bundle_path = temp_bundle_path();
+        let _cleanup = TempBundleCleanup(bundle_path.clone());
+
+        fs::create_dir_all(&bundle_path)?;
+        fs::write(bundle_path.join(TG_PROXY_ASSET_NAME), b"old proxy binary")?;
+        fs::write(
+            version_file_path(&bundle_path),
+            r#"{
+  "tag": "v0.0.0",
+  "release_url": "https://example.invalid/old",
+  "asset_url": "https://example.invalid/old.exe",
+  "digest": null
+}"#,
+        )?;
+
+        let status = check_for_update(&bundle_path)?;
+        assert_eq!(status.installed_tag.as_deref(), Some("v0.0.0"));
+        assert!(status.update_available);
+
+        let message = install_update(&bundle_path, &status.latest)?;
+        assert!(message.contains(&status.latest.tag));
+
+        let installed = read_installed_version(&bundle_path)?.expect("version sidecar exists");
+        assert_eq!(installed.tag, status.latest.tag);
+        assert!(bundle_path.join(TG_PROXY_ASSET_NAME).metadata()?.len() > 1_000_000);
+        assert!(!bundle_path.join("TgWsProxy_windows.old").exists());
+
+        Ok(())
+    }
+
+    fn temp_bundle_path() -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time is after unix epoch")
+            .as_millis();
+        env::temp_dir().join(format!("zapret-hub-tg-proxy-update-test-{stamp}"))
+    }
+
+    struct TempBundleCleanup(PathBuf);
+
+    impl Drop for TempBundleCleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+}

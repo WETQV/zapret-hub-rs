@@ -11,6 +11,7 @@
 - `CF media` uses `DC4 only`, matching the upstream recommendation for the media-loading scenario.
 - Zapret Hub automatically adds the user's `CF media` domain and `kws1/kws2/kws3/kws4/kws5/kws203` hosts to the user hostlist.
 - Added launch diagnostics for Telegram proxy startup.
+- Improved Telegram proxy update diagnostics: failed checks now show the real error and a retry button instead of a stale pending state.
 - Bundled `TG WS Proxy` was staged from the current upstream latest release, `v1.6.0`.
 
 ## Included upstream versions
