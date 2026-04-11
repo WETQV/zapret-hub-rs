@@ -1,0 +1,8 @@
+/target
+/dist
+
+# Local agent/workspace context, not part of the public source release.
+/.agents/
+/_refs/
+/AndroidHub/
+/CHAT_CONTEXT.txt

@@ -1,0 +1,46 @@
+# Sites in this file are added to list-exclude-user.txt when the
+# "Whitelist" toggle is enabled in the app.
+# Blank lines and comment lines starting with "#" are ignored.
+
+gosuslugi.ru
+gosuslugi.gov.ru
+esia.gosuslugi.ru
+
+vk.com
+vk.ru
+vkontakte.ru
+vkvideo.ru
+
+ok.ru
+odnoklassniki.ru
+
+yandex.ru
+ya.ru
+dzen.ru
+go.yandex
+taxi.yandex.ru
+
+burgerking.ru
+vkusnoitochka.ru
+dodopizza.ru
+rostics.ru
+
+ozon.ru
+wildberries.ru
+wb.ru
+
+tbank.ru
+tinkoff.ru
+sberbank.ru
+alfabank.ru
+vtb.ru
+gazprombank.ru
+
+mts.ru
+megafon.ru
+beeline.ru
+t2.ru
+tele2.ru
+rostelecom.ru
+
+nalog.ru
