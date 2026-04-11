@@ -60,6 +60,21 @@ Zapret Hub/
 - автозапуск приложения через Windows Task Scheduler
 - сборка инсталлера через Inno Setup
 
+## Telegram CF media
+
+Если в Telegram работают сообщения, но не грузятся фотографии, видео, реакции или часть файлов, включите режим `CF media` в настройках Telegram proxy.
+
+Для этого нужен свой домен, подключенный к Cloudflare. Общий домен в публичной сборке не используется: он быстро упрётся в лимиты и будет нестабильным для пользователей.
+
+Короткий путь:
+
+1. Подключите свой домен к Cloudflare в режиме `Full setup`.
+2. В Cloudflare включите `SSL/TLS -> Flexible`.
+3. Добавьте proxied DNS-записи `kws1`, `kws2`, `kws3`, `kws4`, `kws5`, `kws203`.
+4. В Zapret Hub откройте настройки Telegram proxy, включите `CF media` и впишите свой домен.
+
+Подробная инструкция с точными DNS-записями и проверками: [docs/TELEGRAM_CF_MEDIA.md](docs/TELEGRAM_CF_MEDIA.md).
+
 ## Структура репозитория
 
 ```text
@@ -87,6 +102,7 @@ zapret-hub-rs/
   docs/
     ARCHITECTURE.md
     RELEASE.md
+    TELEGRAM_CF_MEDIA.md
 ```
 
 ## Что нужно для сборки
