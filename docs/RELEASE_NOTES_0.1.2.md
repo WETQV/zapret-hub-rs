@@ -6,7 +6,7 @@
 
 - Added `CF media` support for Telegram media loading cases where messages work but photos, videos, reactions, or some files do not.
 - Removed the shared default Cloudflare domain from public builds. Users must provide their own Cloudflare domain for `CF media`.
-- Added a setup guide for personal Cloudflare domains: [`docs/TELEGRAM_CF_MEDIA.md`](TELEGRAM_CF_MEDIA.md).
+- Added a setup guide for personal Cloudflare domains: [`docs/TELEGRAM_CF_MEDIA.md`](docs/TELEGRAM_CF_MEDIA.md).
 - `CF media` now syncs the local `TG WS Proxy` config before launch, so stale tray settings do not silently override the app.
 - `CF media` uses `DC4 only`, matching the upstream recommendation for the media-loading scenario.
 - Zapret Hub automatically adds the user's `CF media` domain and `kws1/kws2/kws3/kws4/kws5/kws203` hosts to the user hostlist.
