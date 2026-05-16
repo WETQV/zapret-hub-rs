@@ -2,7 +2,7 @@ use std::env;
 use std::path::PathBuf;
 
 pub(crate) const LEGACY_BUNDLE_PATH: &str =
-    r"C:\Users\mejik\Downloads\zapret-discord-youtube-1.9.7b";
+    r"C:\Users\mejik\Downloads\zapret-discord-youtube-1.9.8c";
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedPaths {

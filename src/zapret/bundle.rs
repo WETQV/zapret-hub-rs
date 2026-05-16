@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
-use crate::core::config::TelegramProxyMode;
+use crate::core::config::{TelegramProxyMode, ZapretProfile};
 use crate::core::process::{
     run_hidden_batch_wait, run_hidden_command_output, run_hidden_command_wait,
     run_visible_batch_detached, try_run_hidden_command,
@@ -57,29 +57,35 @@ struct TelegramProxyAppDataConfig {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BundleAction {
-    StartMainProfile,
-    StartMainProfileWithWhitelist,
-    StartAlt11,
-    StartFakeTlsAutoAlt3,
-    StartAlt7,
+    StartProfile {
+        profile: ZapretProfile,
+        use_builtin_whitelist: bool,
+    },
     StopAll,
+    RefreshIpset,
     InstallService,
     RemoveService,
     OpenServiceManager,
 }
 
 impl BundleAction {
-    fn label(self) -> &'static str {
+    fn label(self) -> String {
         match self {
-            Self::StartMainProfile => "main profile started",
-            Self::StartMainProfileWithWhitelist => "main profile started with whitelist",
-            Self::StartAlt11 => "ALT11 profile started",
-            Self::StartFakeTlsAutoAlt3 => "FAKE TLS AUTO ALT3 profile started",
-            Self::StartAlt7 => "ALT7 profile started",
-            Self::StopAll => "all known bypass processes stopped",
-            Self::InstallService => "service installer launched",
-            Self::RemoveService => "service removal completed",
-            Self::OpenServiceManager => "service manager opened",
+            Self::StartProfile {
+                profile,
+                use_builtin_whitelist,
+            } => {
+                if use_builtin_whitelist {
+                    format!("{} profile started with whitelist", profile.label())
+                } else {
+                    format!("{} profile started", profile.label())
+                }
+            }
+            Self::StopAll => "all known bypass processes stopped".to_owned(),
+            Self::RefreshIpset => "ipset list refreshed from bundled backup".to_owned(),
+            Self::InstallService => "service installer launched".to_owned(),
+            Self::RemoveService => "service removal completed".to_owned(),
+            Self::OpenServiceManager => "service manager opened".to_owned(),
         }
     }
 }
@@ -90,38 +96,15 @@ pub(crate) fn run_action(
     telegram_proxy: &TelegramProxyLaunchConfig,
 ) -> Result<String> {
     match action {
-        BundleAction::StartMainProfile => {
-            sync_builtin_whitelist(bundle_path, false)?;
-            start_profile(
-                bundle_path,
-                "general (SIMPLE FAKE ALT2).bat",
-                telegram_proxy,
-            )?
+        BundleAction::StartProfile {
+            profile,
+            use_builtin_whitelist,
+        } => {
+            sync_builtin_whitelist(bundle_path, use_builtin_whitelist)?;
+            start_profile(bundle_path, profile.script_name(), telegram_proxy)?
         }
-        BundleAction::StartMainProfileWithWhitelist => {
-            sync_builtin_whitelist(bundle_path, true)?;
-            start_profile(
-                bundle_path,
-                "general (SIMPLE FAKE ALT2).bat",
-                telegram_proxy,
-            )?
-        }
-        BundleAction::StartAlt11 => start_profile(
-            bundle_path,
-            "general (ALT11).bat",
-            telegram_proxy,
-        )?,
-        BundleAction::StartFakeTlsAutoAlt3 => start_profile(
-            bundle_path,
-            "general (FAKE TLS AUTO ALT3).bat",
-            telegram_proxy,
-        )?,
-        BundleAction::StartAlt7 => start_profile(
-            bundle_path,
-            "general (ALT7).bat",
-            telegram_proxy,
-        )?,
         BundleAction::StopAll => stop_runtime(bundle_path)?,
+        BundleAction::RefreshIpset => refresh_ipset_from_backup(bundle_path)?,
         BundleAction::InstallService => {
             launch_visible_script(bundle_path, "install_service_simple_fake_alt2.cmd")?
         }
@@ -129,7 +112,33 @@ pub(crate) fn run_action(
         BundleAction::OpenServiceManager => launch_visible_root_script(bundle_path, "service.bat")?,
     }
 
-    Ok(action.label().to_owned())
+    Ok(action.label())
+}
+
+impl ZapretProfile {
+    fn script_name(self) -> &'static str {
+        match self {
+            Self::General => "general.bat",
+            Self::Alt => "general (ALT).bat",
+            Self::Alt2 => "general (ALT2).bat",
+            Self::Alt3 => "general (ALT3).bat",
+            Self::Alt4 => "general (ALT4).bat",
+            Self::Alt5 => "general (ALT5).bat",
+            Self::Alt6 => "general (ALT6).bat",
+            Self::Alt7 => "general (ALT7).bat",
+            Self::Alt8 => "general (ALT8).bat",
+            Self::Alt9 => "general (ALT9).bat",
+            Self::Alt10 => "general (ALT10).bat",
+            Self::Alt11 => "general (ALT11).bat",
+            Self::FakeTlsAuto => "general (FAKE TLS AUTO).bat",
+            Self::FakeTlsAutoAlt => "general (FAKE TLS AUTO ALT).bat",
+            Self::FakeTlsAutoAlt2 => "general (FAKE TLS AUTO ALT2).bat",
+            Self::FakeTlsAutoAlt3 => "general (FAKE TLS AUTO ALT3).bat",
+            Self::SimpleFake => "general (SIMPLE FAKE).bat",
+            Self::SimpleFakeAlt => "general (SIMPLE FAKE ALT).bat",
+            Self::SimpleFakeAlt2 => "general (SIMPLE FAKE ALT2).bat",
+        }
+    }
 }
 
 fn start_profile(
@@ -173,6 +182,20 @@ fn ensure_telegram_media_compat(bundle_path: &Path) -> Result<()> {
     fs::create_dir_all(&lists_dir)?;
     fs::write(lists_dir.join("ipset-all.txt"), "")?;
 
+    Ok(())
+}
+
+fn refresh_ipset_from_backup(bundle_path: &Path) -> Result<()> {
+    let lists_dir = bundle_path.join("lists");
+    let backup_path = lists_dir.join("ipset-all.txt.backup");
+    let target_path = lists_dir.join("ipset-all.txt");
+
+    if !backup_path.is_file() {
+        return Err(anyhow!("ipset backup not found: {}", backup_path.display()));
+    }
+
+    fs::create_dir_all(&lists_dir)?;
+    fs::copy(&backup_path, &target_path)?;
     Ok(())
 }
 
@@ -288,7 +311,10 @@ fn build_telegram_proxy_args(telegram_proxy: &TelegramProxyLaunchConfig) -> Resu
                     "cf media режим требует указать домен Cloudflare для Telegram proxy"
                 ));
             }
-            if domain.chars().any(|char| char.is_whitespace() || char == '"') {
+            if domain
+                .chars()
+                .any(|char| char.is_whitespace() || char == '"')
+            {
                 return Err(anyhow!(
                     "домен Cloudflare для Telegram proxy содержит недопустимые символы"
                 ));
@@ -608,4 +634,60 @@ fn whitelist_file_path() -> Result<PathBuf> {
 
 fn hub_script_path(bundle_path: &Path, script_name: &str) -> PathBuf {
     bundle_path.join("hub").join(script_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn refresh_ipset_copies_backup_to_active_list() {
+        let bundle_dir = unique_temp_dir("zapret-hub-ipset-test");
+        let lists_dir = bundle_dir.join("lists");
+        fs::create_dir_all(&lists_dir).expect("lists dir created");
+        fs::write(lists_dir.join("ipset-all.txt"), "203.0.113.113/32\r\n")
+            .expect("old ipset written");
+        fs::write(
+            lists_dir.join("ipset-all.txt.backup"),
+            "1.1.1.0/24\r\n8.8.8.0/24\r\n",
+        )
+        .expect("backup ipset written");
+
+        refresh_ipset_from_backup(&bundle_dir).expect("ipset refreshed");
+
+        let refreshed =
+            fs::read_to_string(lists_dir.join("ipset-all.txt")).expect("refreshed ipset read");
+        assert_eq!(refreshed, "1.1.1.0/24\r\n8.8.8.0/24\r\n");
+
+        fs::remove_dir_all(bundle_dir).expect("temp bundle removed");
+    }
+
+    #[test]
+    fn all_profiles_map_to_general_batch_files() {
+        let script_names: Vec<&str> = ZapretProfile::ALL
+            .iter()
+            .map(|profile| profile.script_name())
+            .collect();
+
+        assert_eq!(script_names.len(), 19);
+        assert!(script_names.contains(&"general.bat"));
+        assert!(script_names.contains(&"general (ALT11).bat"));
+        assert!(script_names.contains(&"general (FAKE TLS AUTO ALT3).bat"));
+        assert!(script_names.contains(&"general (SIMPLE FAKE ALT2).bat"));
+        assert!(
+            script_names
+                .iter()
+                .all(|script_name| script_name.starts_with("general")
+                    && script_name.ends_with(".bat"))
+        );
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_millis();
+        std::env::temp_dir().join(format!("{prefix}-{millis}"))
+    }
 }

@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -102,10 +102,7 @@ pub(crate) fn install_update(bundle_path: &Path, release: &TelegramProxyRelease)
     let _ = fs::remove_file(&old_path);
     write_installed_version(bundle_path, release)?;
 
-    Ok(format!(
-        "Telegram WS proxy обновлён до {}.",
-        release.tag
-    ))
+    Ok(format!("Telegram WS proxy обновлён до {}.", release.tag))
 }
 
 fn fetch_latest_release() -> Result<TelegramProxyRelease> {
