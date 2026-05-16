@@ -31,19 +31,8 @@ fn create_scheduled_task() -> Result<()> {
     run_hidden_command_wait(
         "schtasks",
         &[
-            "/Create",
-            "/TN",
-            TASK_NAME,
-            "/TR",
-            &task_run,
-            "/SC",
-            "ONLOGON",
-            "/RL",
-            "HIGHEST",
-            "/RU",
-            &username,
-            "/IT",
-            "/F",
+            "/Create", "/TN", TASK_NAME, "/TR", &task_run, "/SC", "ONLOGON", "/RL", "HIGHEST",
+            "/RU", &username, "/IT", "/F",
         ],
         &working_dir()?,
     )
@@ -73,7 +62,10 @@ fn delete_scheduled_task() -> Result<()> {
     } else if !stdout.is_empty() {
         stdout
     } else {
-        format!("schtasks delete exited with status {:?}", output.status.code())
+        format!(
+            "schtasks delete exited with status {:?}",
+            output.status.code()
+        )
     };
 
     anyhow::bail!("{details}");
@@ -99,7 +91,10 @@ fn query_task_xml() -> Result<Option<String>> {
         } else if !stdout.is_empty() {
             stdout
         } else {
-            format!("schtasks query exited with status {:?}", output.status.code())
+            format!(
+                "schtasks query exited with status {:?}",
+                output.status.code()
+            )
         };
 
         anyhow::bail!("{details}");

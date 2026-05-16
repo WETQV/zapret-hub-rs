@@ -64,9 +64,8 @@ fn try_compile_windows_resources() -> Result<(), Box<dyn std::error::Error>> {
         .set("Comments", &format!("Built by {built_by} on {build_date}"))
         .set("InternalName", "zapret-hub-rs.exe")
         .set("LegalCopyright", "Copyright (c) 2026 WETQV")
-        .set_manifest(
-            &format!(
-                r#"
+        .set_manifest(&format!(
+            r#"
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
@@ -77,8 +76,7 @@ fn try_compile_windows_resources() -> Result<(), Box<dyn std::error::Error>> {
   </trustInfo>
 </assembly>
 "#,
-            ),
-        )
+        ))
         .set_version_info(VersionInfo::PRODUCTVERSION, numeric_version)
         .set_version_info(VersionInfo::FILEVERSION, numeric_version);
 

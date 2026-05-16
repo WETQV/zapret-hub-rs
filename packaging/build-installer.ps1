@@ -1,5 +1,5 @@
 param(
-    [string]$BundlePath = "C:\Users\mejik\Downloads\zapret-discord-youtube-1.9.7b"
+    [string]$BundlePath = "C:\Users\mejik\Downloads\zapret-discord-youtube-1.9.8c"
 )
 
 $ErrorActionPreference = "Stop"

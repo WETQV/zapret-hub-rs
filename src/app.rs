@@ -6,23 +6,24 @@ use std::time::Duration;
 use eframe::egui;
 use eframe::egui::{Align, Color32, CornerRadius, RichText, Stroke, Vec2};
 
-use crate::core::autostart;
-use crate::core::bundle_metadata::detect_bundle_version;
-use crate::core::build_info::{APP_AUTHOR, APP_NAME, APP_VERSION, BUILD_DATE, BUILT_BY};
-use crate::core::config::{
-    load_app_config, save_app_config, AppConfig, TelegramProxyMode,
-};
-use crate::core::paths::{is_valid_bundle_dir, resolve_paths, ResolvedPaths};
-use crate::core::status::{refresh_runtime_status, RuntimeStatus, ServiceState};
-use crate::core::tg_proxy_update::{
-    check_for_update as check_tg_proxy_update, install_update as install_tg_proxy_update,
-    TelegramProxyRelease, TelegramProxyUpdateStatus,
-};
-use crate::zapret::bundle::{
-    run_action, BundleAction, TelegramProxyLaunchConfig, TELEGRAM_PROXY_LAUNCH_LOG_FILE_NAME,
-    TELEGRAM_PROXY_LOG_FILE_NAME,
-};
 use crate::LaunchMode;
+use crate::core::autostart;
+use crate::core::build_info::{APP_AUTHOR, APP_NAME, APP_VERSION, BUILD_DATE, BUILT_BY};
+use crate::core::bundle_metadata::detect_bundle_version;
+use crate::core::bundle_update::{
+    BundleRelease, BundleUpdateStatus, check_for_update as check_bundle_update,
+    install_update as install_bundle_update,
+};
+use crate::core::config::{
+    AppConfig, TelegramProxyMode, ZapretProfile, load_app_config, save_app_config,
+};
+use crate::core::paths::{ResolvedPaths, is_valid_bundle_dir, resolve_paths};
+use crate::core::status::{RuntimeStatus, ServiceState, refresh_runtime_status};
+use crate::core::tg_proxy_update::{
+    TelegramProxyRelease, TelegramProxyUpdateStatus, check_for_update as check_tg_proxy_update,
+    install_update as install_tg_proxy_update,
+};
+use crate::zapret::bundle::{BundleAction, TelegramProxyLaunchConfig, run_action};
 
 pub(crate) struct ZapretHubApp {
     bundle_path: PathBuf,
@@ -31,7 +32,11 @@ pub(crate) struct ZapretHubApp {
     status: RuntimeStatus,
     last_profile: Option<&'static str>,
     last_message: String,
+    startup_notices: Vec<StartupNotice>,
     pending_action: Option<PendingAction>,
+    bundle_task: Option<PendingBundleUpdateTask>,
+    bundle_status: Option<BundleUpdateStatus>,
+    bundle_check_error: Option<String>,
     tg_proxy_task: Option<PendingTelegramProxyTask>,
     tg_proxy_status: Option<TelegramProxyUpdateStatus>,
     tg_proxy_check_error: Option<String>,
@@ -53,9 +58,50 @@ struct PendingTelegramProxyTask {
     receiver: Receiver<anyhow::Result<TelegramProxyTaskResult>>,
 }
 
+struct PendingBundleUpdateTask {
+    task: BundleUpdateTask,
+    receiver: Receiver<anyhow::Result<BundleUpdateTaskResult>>,
+}
+
+enum BundleUpdateTask {
+    Check(UpdateCheckReason),
+    Install(BundleRelease),
+}
+
 enum TelegramProxyTask {
-    Check,
+    Check(UpdateCheckReason),
     Install(TelegramProxyRelease),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UpdateCheckReason {
+    Startup,
+    Manual,
+}
+
+#[derive(Clone, Debug)]
+struct StartupNotice {
+    kind: StartupNoticeKind,
+    title: String,
+    message: String,
+}
+
+#[derive(Clone, Debug)]
+enum StartupNoticeKind {
+    AppUpdated,
+    BundleUpdate(String),
+    TelegramProxyUpdate(String),
+}
+
+enum StartupNoticeAction {
+    Close(usize),
+    Dismiss(usize),
+    DisableAll,
+}
+
+enum BundleUpdateTaskResult {
+    Checked(BundleUpdateStatus),
+    Installed(String),
 }
 
 enum TelegramProxyTaskResult {
@@ -70,6 +116,55 @@ struct StatusMonitor {
 
 enum StatusCommand {
     Refresh,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AppTab {
+    Main,
+    Profiles,
+    Telegram,
+    Updates,
+    Settings,
+}
+
+impl AppTab {
+    const ALL: [Self; 5] = [
+        Self::Main,
+        Self::Profiles,
+        Self::Telegram,
+        Self::Updates,
+        Self::Settings,
+    ];
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::Profiles => "profiles",
+            Self::Telegram => "telegram",
+            Self::Updates => "updates",
+            Self::Settings => "settings",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Main => "Главная",
+            Self::Profiles => "Профили",
+            Self::Telegram => "Telegram",
+            Self::Updates => "Обновления",
+            Self::Settings => "Настройки",
+        }
+    }
+
+    fn from_id(id: &str) -> Self {
+        match id {
+            "profiles" => Self::Profiles,
+            "telegram" => Self::Telegram,
+            "updates" => Self::Updates,
+            "settings" => Self::Settings,
+            _ => Self::Main,
+        }
+    }
 }
 
 impl ZapretHubApp {
@@ -111,6 +206,18 @@ impl ZapretHubApp {
         }
 
         let bundle_version = detect_bundle_version(&bundle_dir);
+        let mut startup_notices = Vec::new();
+        if app_config.startup_notifications_enabled
+            && app_config.last_seen_app_version.as_deref() != Some(APP_VERSION)
+        {
+            startup_notices.push(StartupNotice {
+                kind: StartupNoticeKind::AppUpdated,
+                title: "Приложение обновилось".to_owned(),
+                message: format!("Zapret Hub теперь v{APP_VERSION}."),
+            });
+            app_config.last_seen_app_version = Some(APP_VERSION.to_owned());
+            let _ = save_app_config(&app_config);
+        }
 
         let mut app = Self {
             bundle_path: bundle_dir,
@@ -119,7 +226,11 @@ impl ZapretHubApp {
             status,
             last_profile: None,
             last_message,
+            startup_notices,
             pending_action: None,
+            bundle_task: None,
+            bundle_status: None,
+            bundle_check_error: None,
             tg_proxy_task: None,
             tg_proxy_status: None,
             tg_proxy_check_error: None,
@@ -132,10 +243,26 @@ impl ZapretHubApp {
         };
 
         if is_valid_bundle_dir(&app.bundle_path) {
-            app.start_tg_proxy_check();
+            app.start_tg_proxy_check_with_reason(UpdateCheckReason::Startup);
+            app.start_bundle_update_check_with_reason(UpdateCheckReason::Startup);
         }
 
         app
+    }
+
+    fn selected_tab(&self) -> AppTab {
+        AppTab::from_id(&self.app_config.selected_tab)
+    }
+
+    fn set_selected_tab(&mut self, tab: AppTab) {
+        if self.app_config.selected_tab == tab.id() {
+            return;
+        }
+
+        self.app_config.selected_tab = tab.id().to_owned();
+        if let Err(error) = save_app_config(&self.app_config) {
+            self.last_message = format!("Не удалось сохранить выбранную вкладку: {error}");
+        }
     }
 
     fn set_autostart_enabled(&mut self, enabled: bool) {
@@ -162,6 +289,25 @@ impl ZapretHubApp {
         };
     }
 
+    fn set_startup_notifications_enabled(&mut self, enabled: bool) {
+        if enabled == self.app_config.startup_notifications_enabled {
+            return;
+        }
+
+        self.app_config.startup_notifications_enabled = enabled;
+        if !enabled {
+            self.startup_notices.clear();
+        }
+
+        if let Err(error) = save_app_config(&self.app_config) {
+            self.last_message = format!("Не удалось сохранить настройку уведомлений: {error}");
+        } else if enabled {
+            self.last_message = "Стартовые уведомления включены.".to_owned();
+        } else {
+            self.last_message = "Стартовые уведомления выключены.".to_owned();
+        }
+    }
+
     fn set_builtin_whitelist_enabled(&mut self, enabled: bool) {
         if enabled == self.app_config.use_builtin_whitelist {
             return;
@@ -183,6 +329,26 @@ impl ZapretHubApp {
         };
     }
 
+    fn set_main_profile(&mut self, profile: ZapretProfile) {
+        if self.app_config.main_profile == profile {
+            return;
+        }
+
+        self.app_config.main_profile = profile;
+        if let Err(error) = save_app_config(&self.app_config) {
+            self.last_message = format!("Не удалось сохранить основной профиль: {error}");
+        } else {
+            self.last_message = format!("Основной профиль: {}.", profile.label());
+        }
+    }
+
+    fn start_selected_profile(&mut self) {
+        self.start_action(BundleAction::StartProfile {
+            profile: self.app_config.main_profile,
+            use_builtin_whitelist: self.app_config.use_builtin_whitelist,
+        });
+    }
+
     fn start_action(&mut self, action: BundleAction) {
         if self.pending_action.is_some() {
             self.last_message = "Дождитесь завершения текущей команды.".to_owned();
@@ -190,14 +356,7 @@ impl ZapretHubApp {
         }
 
         let telegram_proxy = self.telegram_proxy_launch_config();
-        if matches!(
-            action,
-            BundleAction::StartMainProfile
-                | BundleAction::StartMainProfileWithWhitelist
-                | BundleAction::StartAlt11
-                | BundleAction::StartFakeTlsAutoAlt3
-                | BundleAction::StartAlt7
-        ) {
+        if matches!(action, BundleAction::StartProfile { .. }) {
             if let Err(error) = self.validate_telegram_proxy_config(&telegram_proxy) {
                 self.last_message = format!("Telegram proxy не запущен: {error}");
                 return;
@@ -211,12 +370,16 @@ impl ZapretHubApp {
             let _ = sender.send(result);
         });
 
-        self.last_message = action.in_progress_label().to_owned();
+        self.last_message = action.in_progress_label();
         self.pending_action = Some(PendingAction { action, receiver });
         self.status_monitor.request_refresh();
     }
 
     fn start_tg_proxy_check(&mut self) {
+        self.start_tg_proxy_check_with_reason(UpdateCheckReason::Manual);
+    }
+
+    fn start_tg_proxy_check_with_reason(&mut self, reason: UpdateCheckReason) {
         if self.tg_proxy_task.is_some() || !is_valid_bundle_dir(&self.bundle_path) {
             return;
         }
@@ -232,7 +395,70 @@ impl ZapretHubApp {
 
         self.tg_proxy_check_error = None;
         self.tg_proxy_task = Some(PendingTelegramProxyTask {
-            task: TelegramProxyTask::Check,
+            task: TelegramProxyTask::Check(reason),
+            receiver,
+        });
+    }
+
+    fn start_bundle_update_check(&mut self) {
+        self.start_bundle_update_check_with_reason(UpdateCheckReason::Manual);
+    }
+
+    fn start_bundle_update_check_with_reason(&mut self, reason: UpdateCheckReason) {
+        if self.bundle_task.is_some() || !is_valid_bundle_dir(&self.bundle_path) {
+            return;
+        }
+
+        let bundle_path = self.bundle_path.clone();
+        let repaint_ctx = self.repaint_ctx.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = check_bundle_update(&bundle_path).map(BundleUpdateTaskResult::Checked);
+            let _ = sender.send(result);
+            repaint_ctx.request_repaint();
+        });
+
+        self.bundle_check_error = None;
+        self.bundle_task = Some(PendingBundleUpdateTask {
+            task: BundleUpdateTask::Check(reason),
+            receiver,
+        });
+    }
+
+    fn start_bundle_update(&mut self) {
+        if self.bundle_task.is_some() || self.runtime_is_active() {
+            return;
+        }
+
+        let Some(status) = self.bundle_status.clone() else {
+            self.last_message = if self.bundle_check_error.is_some() {
+                "Проверка обновления bundle завершилась ошибкой. Повторите проверку.".to_owned()
+            } else {
+                "Сначала дождитесь проверки обновления bundle.".to_owned()
+            };
+            return;
+        };
+
+        if !status.update_available {
+            self.last_message = "Bundle уже актуален.".to_owned();
+            return;
+        }
+
+        let release = status.latest;
+        let install_release = release.clone();
+        let bundle_path = self.bundle_path.clone();
+        let repaint_ctx = self.repaint_ctx.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = install_bundle_update(&bundle_path, &install_release)
+                .map(BundleUpdateTaskResult::Installed);
+            let _ = sender.send(result);
+            repaint_ctx.request_repaint();
+        });
+
+        self.last_message = format!("Обновляю bundle до {}.", release.tag);
+        self.bundle_task = Some(PendingBundleUpdateTask {
+            task: BundleUpdateTask::Install(release),
             receiver,
         });
     }
@@ -288,6 +514,74 @@ impl ZapretHubApp {
         }
     }
 
+    fn dismiss_bundle_release(&mut self, tag: &str) {
+        self.app_config.dismissed_bundle_release_tag = Some(tag.to_owned());
+        if let Err(error) = save_app_config(&self.app_config) {
+            self.last_message =
+                format!("Не удалось сохранить напоминание про обновление bundle: {error}");
+        } else {
+            self.last_message =
+                "Напоминание про это обновление bundle скрыто до следующего релиза.".to_owned();
+        }
+    }
+
+    fn add_bundle_update_notice(&mut self, status: &BundleUpdateStatus) {
+        if !self.app_config.startup_notifications_enabled
+            || !status.update_available
+            || self.app_config.dismissed_bundle_release_tag.as_deref()
+                == Some(status.latest.tag.as_str())
+        {
+            return;
+        }
+
+        self.startup_notices.push(StartupNotice {
+            kind: StartupNoticeKind::BundleUpdate(status.latest.tag.clone()),
+            title: "Новая версия Zapret".to_owned(),
+            message: format!(
+                "Доступен bundle {}. Можно обновить во вкладке «Обновления».",
+                status.latest.tag
+            ),
+        });
+    }
+
+    fn add_tg_proxy_update_notice(&mut self, status: &TelegramProxyUpdateStatus) {
+        if !self.app_config.startup_notifications_enabled
+            || !status.update_available
+            || self.app_config.dismissed_tg_proxy_release_tag.as_deref()
+                == Some(status.latest.tag.as_str())
+        {
+            return;
+        }
+
+        self.startup_notices.push(StartupNotice {
+            kind: StartupNoticeKind::TelegramProxyUpdate(status.latest.tag.clone()),
+            title: "Новая версия Tg proxy".to_owned(),
+            message: format!(
+                "Доступен TgWsProxy {}. Можно обновить во вкладке «Обновления».",
+                status.latest.tag
+            ),
+        });
+    }
+
+    fn dismiss_startup_notice(&mut self, index: usize) {
+        if index >= self.startup_notices.len() {
+            return;
+        }
+
+        let notice = self.startup_notices.remove(index);
+        match notice.kind {
+            StartupNoticeKind::AppUpdated => {}
+            StartupNoticeKind::BundleUpdate(tag) => {
+                self.app_config.dismissed_bundle_release_tag = Some(tag);
+                let _ = save_app_config(&self.app_config);
+            }
+            StartupNoticeKind::TelegramProxyUpdate(tag) => {
+                self.app_config.dismissed_tg_proxy_release_tag = Some(tag);
+                let _ = save_app_config(&self.app_config);
+            }
+        }
+    }
+
     fn poll_action_completion(&mut self) {
         if let Some(pending) = &self.pending_action {
             match pending.receiver.try_recv() {
@@ -298,13 +592,7 @@ impl ZapretHubApp {
                     match result {
                         Ok(message) => {
                             self.last_profile = match action {
-                                BundleAction::StartMainProfile
-                                | BundleAction::StartMainProfileWithWhitelist => {
-                                    Some("SIMPLE FAKE ALT2")
-                                }
-                                BundleAction::StartAlt11 => Some("ALT11"),
-                                BundleAction::StartFakeTlsAutoAlt3 => Some("FAKE TLS AUTO ALT3"),
-                                BundleAction::StartAlt7 => Some("ALT7"),
+                                BundleAction::StartProfile { profile, .. } => Some(profile.label()),
                                 BundleAction::StopAll | BundleAction::RemoveService => None,
                                 _ => self.last_profile,
                             };
@@ -334,7 +622,7 @@ impl ZapretHubApp {
             match pending.receiver.try_recv() {
                 Ok(result) => {
                     let task = match &pending.task {
-                        TelegramProxyTask::Check => TelegramProxyTask::Check,
+                        TelegramProxyTask::Check(reason) => TelegramProxyTask::Check(*reason),
                         TelegramProxyTask::Install(release) => {
                             TelegramProxyTask::Install(release.clone())
                         }
@@ -343,6 +631,10 @@ impl ZapretHubApp {
 
                     match result {
                         Ok(TelegramProxyTaskResult::Checked(status)) => {
+                            if matches!(task, TelegramProxyTask::Check(UpdateCheckReason::Startup))
+                            {
+                                self.add_tg_proxy_update_notice(&status);
+                            }
                             self.tg_proxy_status = Some(status);
                             self.tg_proxy_check_error = None;
                         }
@@ -353,10 +645,12 @@ impl ZapretHubApp {
                             self.start_tg_proxy_check();
                         }
                         Err(error) => {
-                            let was_check = matches!(task, TelegramProxyTask::Check);
+                            let was_check = matches!(task, TelegramProxyTask::Check(_));
                             let message = match task {
-                                TelegramProxyTask::Check => {
-                                    format!("Не удалось проверить обновление Telegram proxy: {error}")
+                                TelegramProxyTask::Check(_) => {
+                                    format!(
+                                        "Не удалось проверить обновление Telegram proxy: {error}"
+                                    )
                                 }
                                 TelegramProxyTask::Install(_) => {
                                     format!("Не удалось обновить Telegram proxy: {error}")
@@ -372,6 +666,62 @@ impl ZapretHubApp {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.tg_proxy_task = None;
                     self.last_message = "Фоновая задача Telegram proxy была прервана.".to_owned();
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+    }
+
+    fn poll_bundle_task_completion(&mut self) {
+        if let Some(pending) = &self.bundle_task {
+            match pending.receiver.try_recv() {
+                Ok(result) => {
+                    let task = match &pending.task {
+                        BundleUpdateTask::Check(reason) => BundleUpdateTask::Check(*reason),
+                        BundleUpdateTask::Install(release) => {
+                            BundleUpdateTask::Install(release.clone())
+                        }
+                    };
+                    self.bundle_task = None;
+
+                    match result {
+                        Ok(BundleUpdateTaskResult::Checked(status)) => {
+                            if matches!(task, BundleUpdateTask::Check(UpdateCheckReason::Startup)) {
+                                self.add_bundle_update_notice(&status);
+                            }
+                            self.bundle_status = Some(status);
+                            self.bundle_check_error = None;
+                        }
+                        Ok(BundleUpdateTaskResult::Installed(message)) => {
+                            self.last_message = message;
+                            self.bundle_version = detect_bundle_version(&self.bundle_path);
+                            self.app_config.dismissed_bundle_release_tag = None;
+                            let _ = save_app_config(&self.app_config);
+                            self.start_bundle_update_check();
+                            self.start_tg_proxy_check();
+                            self.status_monitor.request_refresh();
+                        }
+                        Err(error) => {
+                            let was_check = matches!(task, BundleUpdateTask::Check(_));
+                            let message = match task {
+                                BundleUpdateTask::Check(_) => {
+                                    format!("Не удалось проверить обновление bundle: {error}")
+                                }
+                                BundleUpdateTask::Install(_) => {
+                                    format!("Не удалось обновить bundle: {error}")
+                                }
+                            };
+                            if was_check {
+                                self.bundle_check_error = Some(error.to_string());
+                            }
+                            self.last_message = message;
+                        }
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.bundle_task = None;
+                    self.last_message =
+                        "Фоновая задача обновления bundle была прервана.".to_owned();
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
@@ -447,6 +797,9 @@ impl ZapretHubApp {
             BundleAction::RemoveService => {
                 format!("{action_message}. Удаление сервиса и очистка WinDivert были запрошены.")
             }
+            BundleAction::RefreshIpset => {
+                format!("{action_message}. Файл lists\\ipset-all.txt заменён из bundled backup.")
+            }
             BundleAction::InstallService | BundleAction::OpenServiceManager => {
                 format!("{action_message}. Завершите действие в открывшемся окне.")
             }
@@ -497,8 +850,7 @@ impl ZapretHubApp {
 
         self.app_config.telegram_proxy_mode = mode.clone();
         if let Err(error) = save_app_config(&self.app_config) {
-            self.last_message =
-                format!("Не удалось сохранить режим Telegram proxy: {error}");
+            self.last_message = format!("Не удалось сохранить режим Telegram proxy: {error}");
             return;
         }
 
@@ -507,8 +859,7 @@ impl ZapretHubApp {
                 "Telegram proxy переведён в обычный режим: DC2/DC4/DC203.".to_owned()
             }
             TelegramProxyMode::CfMedia => {
-                "Telegram proxy переведён в CF media режим. Укажите домен Cloudflare."
-                    .to_owned()
+                "Telegram proxy переведён в CF media режим. Укажите домен Cloudflare.".to_owned()
             }
         };
     }
@@ -520,8 +871,7 @@ impl ZapretHubApp {
 
         self.app_config.telegram_cf_domain = domain;
         if let Err(error) = save_app_config(&self.app_config) {
-            self.last_message =
-                format!("Не удалось сохранить домен для Telegram proxy: {error}");
+            self.last_message = format!("Не удалось сохранить домен для Telegram proxy: {error}");
         } else {
             self.last_message = format!(
                 "Домен для CF media сохранён: {}.",
@@ -547,6 +897,30 @@ impl ZapretHubApp {
 
     fn tg_proxy_controls_enabled(&self) -> bool {
         self.pending_action.is_none() && self.tg_proxy_task.is_none() && !self.runtime_is_active()
+    }
+
+    fn bundle_update_controls_enabled(&self) -> bool {
+        self.pending_action.is_none() && self.bundle_task.is_none() && !self.runtime_is_active()
+    }
+
+    fn runtime_toggle_enabled(&self) -> bool {
+        self.pending_action.is_none() && self.bundle_task.is_none()
+    }
+
+    fn runtime_toggle_label(&self) -> String {
+        if self.runtime_is_active() {
+            "Выключить".to_owned()
+        } else {
+            format!("Включить {}", self.app_config.main_profile.label())
+        }
+    }
+
+    fn toggle_runtime(&mut self) {
+        if self.runtime_is_active() {
+            self.start_action(BundleAction::StopAll);
+        } else {
+            self.start_selected_profile();
+        }
     }
 
     fn state_badge(ui: &mut egui::Ui, text: &str, color: Color32) {
@@ -635,6 +1009,7 @@ impl ZapretHubApp {
                     "Сервис zapret",
                     Self::service_text(self.status.service_state),
                 );
+                Self::status_row(ui, "Основной профиль", self.app_config.main_profile.label());
                 if let Some(profile) = self.last_profile {
                     Self::status_row(ui, "Последний профиль", profile);
                 }
@@ -657,35 +1032,36 @@ impl ZapretHubApp {
 
                 ui.horizontal(|ui| {
                     let button_width = (ui.available_width() - 370.0).max(180.0);
-                    let start_action = if self.app_config.use_builtin_whitelist {
-                        BundleAction::StartMainProfileWithWhitelist
-                    } else {
-                        BundleAction::StartMainProfile
-                    };
                     let start_caption = if self.app_config.use_builtin_whitelist {
                         if self.app_config.launch_telegram_proxy_for_profiles {
-                            "Запускает SIMPLE FAKE ALT2, Telegram WS proxy и добавляет встроенный список исключений."
+                            "Запускает выбранный основной профиль, Telegram WS proxy и добавляет встроенный список исключений."
                         } else {
-                            "Запускает SIMPLE FAKE ALT2 и добавляет встроенный список исключений."
+                            "Запускает выбранный основной профиль и добавляет встроенный список исключений."
                         }
                     } else {
                         if self.app_config.launch_telegram_proxy_for_profiles {
-                            "Запускает SIMPLE FAKE ALT2 и Telegram WS proxy."
+                            "Запускает выбранный основной профиль и Telegram WS proxy."
                         } else {
-                            "Запускает SIMPLE FAKE ALT2 без Telegram WS proxy."
+                            "Запускает выбранный основной профиль без Telegram WS proxy."
                         }
                     };
 
                     if ui
                         .add_enabled(
                             start_enabled,
-                            egui::Button::new(RichText::new("Запустить основной профиль").strong())
+                            egui::Button::new(
+                                RichText::new(format!(
+                                    "Запустить {}",
+                                    self.app_config.main_profile.label()
+                                ))
+                                .strong(),
+                            )
                                 .min_size(Vec2::new(button_width, 42.0)),
                         )
                         .on_hover_text(start_caption)
                         .clicked()
                     {
-                        self.start_action(start_action);
+                        self.start_selected_profile();
                     }
 
                     let mut use_builtin_whitelist = self.app_config.use_builtin_whitelist;
@@ -831,53 +1207,52 @@ impl ZapretHubApp {
     }
 
     fn draw_profiles(&mut self, ui: &mut egui::Ui) {
-        let enabled = self.profile_actions_enabled();
+        let can_select = self.pending_action.is_none();
+        let can_start = self.profile_actions_enabled();
+        let column_count = if ui.available_width() > 760.0 { 3 } else { 2 };
 
         Self::card(
             ui,
-            "Дополнительные профили",
-            "Запасные пресеты, если основной профиль не подходит.",
+            "Профили",
+            "Выберите пресет, который будет считаться основным.",
             |ui| {
                 if let Some(message) = self.runtime_lock_message() {
                     ui.label(RichText::new(message).color(Color32::from_rgb(198, 120, 0)));
                     ui.add_space(8.0);
                 }
 
-                if Self::primary_button(
-                    ui,
-                    "ALT11",
-                    &self.profile_launch_caption("ALT11"),
-                    enabled,
-                )
-                    .clicked()
-                {
-                    self.start_action(BundleAction::StartAlt11);
-                }
+                let profiles = ZapretProfile::ALL;
+                ui.columns(column_count, |columns| {
+                    for (index, profile) in profiles.iter().enumerate() {
+                        let column = &mut columns[index % column_count];
+                        column.horizontal(|ui| {
+                            let selected = self.app_config.main_profile == *profile;
+                            let response = ui.add_enabled(
+                                can_select,
+                                egui::RadioButton::new(selected, profile.label()),
+                            );
+                            if response.clicked() {
+                                self.set_main_profile(*profile);
+                            }
+
+                            if selected {
+                                Self::state_badge(ui, "основной", Color32::from_rgb(0, 132, 80));
+                            }
+                        });
+                        column.add_space(6.0);
+                    }
+                });
 
                 ui.add_space(8.0);
-
                 if Self::primary_button(
                     ui,
-                    "FAKE TLS AUTO ALT3",
-                    &self.profile_launch_caption("FAKE TLS AUTO ALT3"),
-                    enabled,
+                    "Запустить выбранный профиль",
+                    &self.profile_launch_caption(self.app_config.main_profile.label()),
+                    can_start,
                 )
                 .clicked()
                 {
-                    self.start_action(BundleAction::StartFakeTlsAutoAlt3);
-                }
-
-                ui.add_space(8.0);
-
-                if Self::primary_button(
-                    ui,
-                    "ALT7",
-                    &self.profile_launch_caption("ALT7"),
-                    enabled,
-                )
-                    .clicked()
-                {
-                    self.start_action(BundleAction::StartAlt7);
+                    self.start_selected_profile();
                 }
             },
         );
@@ -975,136 +1350,44 @@ impl ZapretHubApp {
                 );
 
                 ui.add_space(12.0);
-                ui.separator();
-                ui.add_space(12.0);
-
-                let tg_proxy_status = self.tg_proxy_status.clone();
-                if let Some(status) = tg_proxy_status {
-                    let installed = status.installed_tag.as_deref().unwrap_or("неизвестно");
-                    Self::status_row(ui, "Telegram proxy в bundle", installed);
-                    Self::status_row(ui, "Последний релиз", status.latest.tag.as_str());
-                    Self::status_row(
-                        ui,
-                        "Режим Telegram proxy",
-                        self.telegram_proxy_mode_label(self.app_config.telegram_proxy_mode.clone()),
-                    );
-                    Self::status_row(
-                        ui,
-                        "Лог Telegram proxy",
-                        self.bundle_path
-                            .join(TELEGRAM_PROXY_LOG_FILE_NAME)
-                            .display()
-                            .to_string(),
-                    );
-                    Self::status_row(
-                        ui,
-                        "Launch-лог Telegram proxy",
-                        self.bundle_path
-                            .join(TELEGRAM_PROXY_LAUNCH_LOG_FILE_NAME)
-                            .display()
-                            .to_string(),
-                    );
-                    if self.app_config.telegram_proxy_mode == TelegramProxyMode::CfMedia
-                        && !self.app_config.telegram_cf_domain.trim().is_empty()
-                    {
-                        Self::status_row(
-                            ui,
-                            "CF домен",
-                            self.app_config.telegram_cf_domain.trim().to_owned(),
-                        );
-                    }
-
-                    if status.update_available {
-                        let dismissed = self
-                            .app_config
-                            .dismissed_tg_proxy_release_tag
-                            .as_deref()
-                            == Some(status.latest.tag.as_str());
-
-                        if dismissed {
-                            ui.label(
-                                RichText::new(
-                                    "Обновление Telegram proxy скрыто до следующего релиза.",
-                                )
-                                .color(Color32::from_gray(120)),
-                            );
-                        } else {
-                            ui.label(
-                                RichText::new(
-                                    "Доступно обновление Telegram WS proxy. Старые версии хранить не нужно: бинарь заменяется на месте.",
-                                )
-                                .color(Color32::from_rgb(198, 120, 0)),
-                            );
-                        }
-
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            let can_update = self.tg_proxy_controls_enabled();
-                            if ui
-                                .add_enabled(
-                                    can_update && !dismissed,
-                                    egui::Button::new("Обновить Telegram proxy сейчас"),
-                                )
-                                .on_hover_text(
-                                    "Скачивает последний TgWsProxy_windows.exe и заменяет текущий файл без хранения старой версии.",
-                                )
-                                .clicked()
-                            {
-                                self.start_tg_proxy_update();
-                            }
-
-                            if ui
-                                .add_enabled(
-                                    self.tg_proxy_task.is_none() && !dismissed,
-                                    egui::Button::new("Позже"),
-                                )
-                                .clicked()
-                            {
-                                self.dismiss_tg_proxy_release(&status.latest.tag);
-                            }
-                        });
-
-                        if !self.tg_proxy_controls_enabled() {
-                            ui.add_space(8.0);
-                            ui.label(
-                                RichText::new(
-                                    "Остановите текущий профиль или proxy перед обновлением Telegram proxy.",
-                                )
-                                .color(Color32::from_gray(120)),
-                            );
-                        }
-                    } else {
-                        ui.label(
-                            RichText::new("Telegram WS proxy уже актуален.")
-                                .color(Color32::from_rgb(0, 132, 80)),
-                        );
-                    }
-                } else if self.tg_proxy_task.is_some() {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Проверяю обновления Telegram proxy.");
-                    });
-                } else if let Some(error) = self.tg_proxy_check_error.clone() {
-                    ui.label(
-                        RichText::new("Не удалось проверить обновления Telegram proxy.")
-                            .color(Color32::from_rgb(198, 120, 0)),
-                    );
-                    ui.add_space(6.0);
-                    ui.label(RichText::new(error).color(Color32::from_gray(120)));
-                    ui.add_space(8.0);
-                    if ui.button("Повторить проверку").clicked() {
-                        self.start_tg_proxy_check();
-                    }
-                } else {
-                    ui.label(
-                        RichText::new("Проверка обновлений Telegram proxy ещё не запускалась.")
-                            .color(Color32::from_gray(120)),
-                    );
-                    ui.add_space(8.0);
-                    if ui.button("Проверить Telegram proxy").clicked() {
-                        self.start_tg_proxy_check();
-                    }
+                let mut startup_notifications_enabled =
+                    self.app_config.startup_notifications_enabled;
+                let response = ui.checkbox(
+                    &mut startup_notifications_enabled,
+                    "Показывать мягкие уведомления при запуске",
+                );
+                if response.changed() {
+                    self.set_startup_notifications_enabled(startup_notifications_enabled);
                 }
+                ui.label(
+                    RichText::new(
+                        "Показывает только стартовые карточки про обновление приложения, Zapret bundle и Tg proxy.",
+                    )
+                    .color(Color32::from_gray(120)),
+                );
+            },
+        );
+
+        ui.add_space(12.0);
+        self.draw_project_links(ui);
+    }
+
+    fn draw_project_links(&mut self, ui: &mut egui::Ui) {
+        Self::card(
+            ui,
+            "Ссылки",
+            "Оригинальные проекты и репозиторий Zapret Hub.",
+            |ui| {
+                ui.hyperlink_to("Zapret Hub", "https://github.com/WETQV/zapret-hub-rs");
+                ui.hyperlink_to("bol-van/zapret", "https://github.com/bol-van/zapret");
+                ui.hyperlink_to(
+                    "Flowseal/zapret-discord-youtube",
+                    "https://github.com/Flowseal/zapret-discord-youtube",
+                );
+                ui.hyperlink_to(
+                    "Flowseal/tg-ws-proxy",
+                    "https://github.com/Flowseal/tg-ws-proxy",
+                );
             },
         );
     }
@@ -1135,22 +1418,453 @@ impl ZapretHubApp {
             },
         );
     }
+
+    fn draw_startup_notices(&mut self, ui: &mut egui::Ui) {
+        if self.startup_notices.is_empty() {
+            return;
+        }
+
+        let mut action = None;
+        Self::card(
+            ui,
+            "Уведомления",
+            "Показываются только после запуска приложения.",
+            |ui| {
+                for (index, notice) in self.startup_notices.iter().enumerate() {
+                    if index > 0 {
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+                    }
+
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(&notice.title).strong());
+                            ui.label(RichText::new(&notice.message).color(Color32::from_gray(120)));
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button("Закрыть").clicked() {
+                                action = Some(StartupNoticeAction::Close(index));
+                            }
+                            if !matches!(notice.kind, StartupNoticeKind::AppUpdated)
+                                && ui.button("Не показывать этот релиз").clicked()
+                            {
+                                action = Some(StartupNoticeAction::Dismiss(index));
+                            }
+                        });
+                    });
+                }
+
+                ui.add_space(10.0);
+                if ui.button("Отключить все стартовые уведомления").clicked()
+                {
+                    action = Some(StartupNoticeAction::DisableAll);
+                }
+            },
+        );
+
+        match action {
+            Some(StartupNoticeAction::Close(index)) => {
+                if index < self.startup_notices.len() {
+                    self.startup_notices.remove(index);
+                }
+            }
+            Some(StartupNoticeAction::Dismiss(index)) => self.dismiss_startup_notice(index),
+            Some(StartupNoticeAction::DisableAll) => {
+                self.set_startup_notifications_enabled(false);
+            }
+            None => {}
+        }
+    }
+
+    fn draw_telegram_settings(&mut self, ui: &mut egui::Ui) {
+        Self::card(
+            ui,
+            "Telegram proxy",
+            "Отдельные настройки Telegram WS proxy и CF media.",
+            |ui| {
+                let enabled = self.profile_actions_enabled();
+
+                let mut launch_proxy = self.app_config.launch_telegram_proxy_for_profiles;
+                let proxy_checkbox = ui.add_enabled(
+                    enabled,
+                    egui::Checkbox::new(&mut launch_proxy, "Запускать вместе с профилями"),
+                );
+                if proxy_checkbox.changed() {
+                    self.app_config.launch_telegram_proxy_for_profiles = launch_proxy;
+                    if let Err(error) = save_app_config(&self.app_config) {
+                        self.last_message =
+                            format!("Не удалось сохранить режим запуска Telegram proxy: {error}");
+                    }
+                }
+
+                ui.add_space(8.0);
+                ui.add_enabled_ui(enabled, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Режим");
+                        let mut selected_mode = self.app_config.telegram_proxy_mode.clone();
+                        egui::ComboBox::from_id_salt("telegram_proxy_mode_tab")
+                            .selected_text(self.telegram_proxy_mode_label(selected_mode.clone()))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut selected_mode,
+                                    TelegramProxyMode::Standard,
+                                    "Обычный",
+                                );
+                                ui.selectable_value(
+                                    &mut selected_mode,
+                                    TelegramProxyMode::CfMedia,
+                                    "CF media",
+                                );
+                            });
+                        if selected_mode != self.app_config.telegram_proxy_mode {
+                            self.set_telegram_proxy_mode(selected_mode);
+                        }
+                    });
+
+                    if self.app_config.telegram_proxy_mode == TelegramProxyMode::CfMedia {
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Cloudflare домен");
+                            let mut domain = self.app_config.telegram_cf_domain.clone();
+                            let response = ui.add_sized(
+                                [280.0, 30.0],
+                                egui::TextEdit::singleline(&mut domain)
+                                    .hint_text("your-domain.example"),
+                            );
+                            if response.changed() {
+                                self.set_telegram_cf_domain(domain.trim().to_owned());
+                            }
+
+                            if ui
+                                .add_enabled(
+                                    !self.app_config.telegram_cf_domain.trim().is_empty(),
+                                    egui::Button::new("Очистить"),
+                                )
+                                .clicked()
+                            {
+                                self.reset_telegram_cf_domain_to_default();
+                            }
+                        });
+                    }
+                });
+
+                if !enabled {
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(
+                            "Остановите текущий профиль, чтобы менять режим Telegram proxy.",
+                        )
+                        .color(Color32::from_gray(120)),
+                    );
+                }
+            },
+        );
+    }
+
+    fn draw_updates(&mut self, ui: &mut egui::Ui) {
+        Self::card(
+            ui,
+            "Bundle",
+            "Проверка и установка свежего upstream bundle без нового релиза Hub.",
+            |ui| {
+                if let Some(status) = self.bundle_status.clone() {
+                    Self::status_row(
+                        ui,
+                        "Текущая версия",
+                        status
+                            .installed_version
+                            .as_deref()
+                            .unwrap_or("неизвестно")
+                            .to_owned(),
+                    );
+                    Self::status_row(ui, "Последний релиз", status.latest.tag.as_str());
+                    Self::status_row(ui, "Страница релиза", status.latest.release_url.as_str());
+                    Self::status_row(ui, "Asset", status.latest.asset_name.as_str());
+
+                    if status.update_available {
+                        let dismissed = self.app_config.dismissed_bundle_release_tag.as_deref()
+                            == Some(status.latest.tag.as_str());
+
+                        ui.add_space(8.0);
+                        if dismissed {
+                            ui.label(
+                                RichText::new(
+                                    "Обновление bundle скрыто до следующего upstream релиза.",
+                                )
+                                .color(Color32::from_gray(120)),
+                            );
+                        } else {
+                            ui.label(
+                                RichText::new("Доступен новый bundle. Установка заменит bundle целиком и сохранит пользовательские списки.")
+                                    .color(Color32::from_rgb(198, 120, 0)),
+                            );
+                        }
+
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            let can_update = self.bundle_update_controls_enabled();
+                            if ui
+                                .add_enabled(
+                                    can_update && !dismissed,
+                                    egui::Button::new("Обновить bundle"),
+                                )
+                                .on_hover_text("Скачает официальный zip Flowseal, подготовит hub scripts и заменит bundle.")
+                                .clicked()
+                            {
+                                self.start_bundle_update();
+                            }
+
+                            if ui
+                                .add_enabled(
+                                    self.bundle_task.is_none() && !dismissed,
+                                    egui::Button::new("Позже"),
+                                )
+                                .clicked()
+                            {
+                                self.dismiss_bundle_release(&status.latest.tag);
+                            }
+                        });
+
+                        if !self.bundle_update_controls_enabled() {
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new("Остановите текущий профиль, сервис и Telegram proxy перед обновлением bundle.")
+                                    .color(Color32::from_gray(120)),
+                            );
+                        }
+                    } else {
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new("Bundle уже актуален.")
+                                .color(Color32::from_rgb(0, 132, 80)),
+                        );
+                    }
+                } else if self.bundle_task.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Проверяю обновления bundle.");
+                    });
+                } else if let Some(error) = self.bundle_check_error.clone() {
+                    ui.label(
+                        RichText::new("Не удалось проверить обновления bundle.")
+                            .color(Color32::from_rgb(198, 120, 0)),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(error).color(Color32::from_gray(120)));
+                } else {
+                    ui.label(
+                        RichText::new("Проверка обновлений bundle ещё не запускалась.")
+                            .color(Color32::from_gray(120)),
+                    );
+                }
+
+                ui.add_space(10.0);
+                if ui
+                    .add_enabled(
+                        self.bundle_task.is_none(),
+                        egui::Button::new("Проверить обновления bundle"),
+                    )
+                    .clicked()
+                {
+                    self.start_bundle_update_check();
+                }
+            },
+        );
+
+        ui.add_space(12.0);
+        self.draw_lists_update_card(ui);
+
+        ui.add_space(12.0);
+        self.draw_tg_proxy_update_card(ui);
+    }
+
+    fn draw_lists_update_card(&mut self, ui: &mut egui::Ui) {
+        let enabled = self.service_tools_enabled();
+
+        Self::card(
+            ui,
+            "Списки",
+            "Локальное обслуживание hostlist и ipset внутри текущего bundle.",
+            |ui| {
+                Self::status_row(
+                    ui,
+                    "ipset",
+                    self.bundle_path
+                        .join("lists")
+                        .join("ipset-all.txt")
+                        .display()
+                        .to_string(),
+                );
+                Self::status_row(
+                    ui,
+                    "Источник",
+                    self.bundle_path
+                        .join("lists")
+                        .join("ipset-all.txt.backup")
+                        .display()
+                        .to_string(),
+                );
+
+                ui.add_space(10.0);
+                if ui
+                    .add_enabled(enabled, egui::Button::new("Обновить ipset"))
+                    .on_hover_text(
+                        "Восстановит lists\\ipset-all.txt из bundled ipset-all.txt.backup.",
+                    )
+                    .clicked()
+                {
+                    self.start_action(BundleAction::RefreshIpset);
+                }
+
+                if !enabled {
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(
+                            "Остановите текущий профиль или сервис перед обновлением ipset.",
+                        )
+                        .color(Color32::from_gray(120)),
+                    );
+                }
+            },
+        );
+    }
+
+    fn draw_tg_proxy_update_card(&mut self, ui: &mut egui::Ui) {
+        Self::card(
+            ui,
+            "Telegram WS proxy",
+            "Независимое обновление TgWsProxy_windows.exe внутри текущего bundle.",
+            |ui| {
+                let tg_proxy_status = self.tg_proxy_status.clone();
+                if let Some(status) = tg_proxy_status {
+                    let installed = status.installed_tag.as_deref().unwrap_or("неизвестно");
+                    Self::status_row(ui, "Telegram proxy в bundle", installed);
+                    Self::status_row(ui, "Последний релиз", status.latest.tag.as_str());
+
+                    if status.update_available {
+                        let dismissed = self.app_config.dismissed_tg_proxy_release_tag.as_deref()
+                            == Some(status.latest.tag.as_str());
+
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            let can_update = self.tg_proxy_controls_enabled();
+                            if ui
+                                .add_enabled(
+                                    can_update && !dismissed,
+                                    egui::Button::new("Обновить Telegram proxy"),
+                                )
+                                .clicked()
+                            {
+                                self.start_tg_proxy_update();
+                            }
+
+                            if ui
+                                .add_enabled(
+                                    self.tg_proxy_task.is_none() && !dismissed,
+                                    egui::Button::new("Позже"),
+                                )
+                                .clicked()
+                            {
+                                self.dismiss_tg_proxy_release(&status.latest.tag);
+                            }
+                        });
+                    } else {
+                        ui.label(
+                            RichText::new("Telegram WS proxy уже актуален.")
+                                .color(Color32::from_rgb(0, 132, 80)),
+                        );
+                    }
+                } else if self.tg_proxy_task.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Проверяю обновления Telegram proxy.");
+                    });
+                } else if let Some(error) = self.tg_proxy_check_error.clone() {
+                    ui.label(
+                        RichText::new("Не удалось проверить обновления Telegram proxy.")
+                            .color(Color32::from_rgb(198, 120, 0)),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(error).color(Color32::from_gray(120)));
+                }
+
+                ui.add_space(10.0);
+                if ui
+                    .add_enabled(
+                        self.tg_proxy_task.is_none(),
+                        egui::Button::new("Проверить Telegram proxy"),
+                    )
+                    .clicked()
+                {
+                    self.start_tg_proxy_check();
+                }
+            },
+        );
+    }
+
+    fn draw_tab_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            for tab in AppTab::ALL {
+                let selected = self.selected_tab() == tab;
+                let response = ui.selectable_label(selected, tab.label());
+                if response.clicked() {
+                    self.set_selected_tab(tab);
+                }
+            }
+        });
+    }
+
+    fn draw_current_tab(&mut self, ui: &mut egui::Ui) {
+        match self.selected_tab() {
+            AppTab::Main => {
+                self.draw_startup_notices(ui);
+                if !self.startup_notices.is_empty() {
+                    ui.add_space(12.0);
+                }
+                self.draw_overview(ui);
+                ui.add_space(12.0);
+                self.draw_primary_actions(ui);
+                ui.add_space(12.0);
+                self.draw_status_log(ui);
+            }
+            AppTab::Profiles => self.draw_profiles(ui),
+            AppTab::Telegram => {
+                self.draw_telegram_settings(ui);
+                ui.add_space(12.0);
+                self.draw_tg_proxy_update_card(ui);
+            }
+            AppTab::Updates => self.draw_updates(ui),
+            AppTab::Settings => {
+                self.draw_service_tools(ui);
+                ui.add_space(12.0);
+                self.draw_installation_info(ui);
+            }
+        }
+    }
 }
 
 impl BundleAction {
-    fn in_progress_label(self) -> &'static str {
+    fn in_progress_label(self) -> String {
         match self {
-            BundleAction::StartMainProfile => "Запускаю основной профиль.",
-            BundleAction::StartMainProfileWithWhitelist => {
-                "Запускаю основной профиль со встроенным списком исключений."
+            BundleAction::StartProfile {
+                profile,
+                use_builtin_whitelist,
+            } => {
+                if use_builtin_whitelist {
+                    format!(
+                        "Запускаю основной профиль {} со встроенным списком исключений.",
+                        profile.label()
+                    )
+                } else {
+                    format!("Запускаю основной профиль {}.", profile.label())
+                }
             }
-            BundleAction::StartAlt11 => "Запускаю ALT11.",
-            BundleAction::StartFakeTlsAutoAlt3 => "Запускаю FAKE TLS AUTO ALT3.",
-            BundleAction::StartAlt7 => "Запускаю ALT7.",
-            BundleAction::StopAll => "Останавливаю bypass, proxy и связанные процессы.",
-            BundleAction::InstallService => "Открываю установку сервиса.",
-            BundleAction::RemoveService => "Удаляю сервис и останавливаю остатки.",
-            BundleAction::OpenServiceManager => "Открываю service.bat.",
+            BundleAction::StopAll => "Останавливаю bypass, proxy и связанные процессы.".to_owned(),
+            BundleAction::RefreshIpset => "Обновляю ipset из bundled backup.".to_owned(),
+            BundleAction::InstallService => "Открываю установку сервиса.".to_owned(),
+            BundleAction::RemoveService => "Удаляю сервис и останавливаю остатки.".to_owned(),
+            BundleAction::OpenServiceManager => "Открываю service.bat.".to_owned(),
         }
     }
 }
@@ -1159,6 +1873,7 @@ impl eframe::App for ZapretHubApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_action_completion();
         self.poll_tg_proxy_task_completion();
+        self.poll_bundle_task_completion();
         self.poll_status_updates();
 
         if self.launch_mode.is_autostart() && !self.startup_view_applied {
@@ -1170,16 +1885,23 @@ impl eframe::App for ZapretHubApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
-        if self.pending_action.is_some() || self.tg_proxy_task.is_some() {
+        if self.pending_action.is_some()
+            || self.tg_proxy_task.is_some()
+            || self.bundle_task.is_some()
+        {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 
         if ctx.input(|i| i.viewport().close_requested()) {
-            if self.pending_action.is_some() {
+            if self.pending_action.is_some() || self.bundle_task.is_some() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.last_message =
+                self.last_message = if self.bundle_task.is_some() {
+                    "Сначала дождитесь завершения обновления bundle, потом закрывайте окно."
+                        .to_owned()
+                } else {
                     "Сначала дождитесь завершения текущей команды, потом закрывайте окно."
-                        .to_owned();
+                        .to_owned()
+                };
             } else if self.runtime_is_active() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.close_after_stop = true;
@@ -1205,44 +1927,32 @@ impl eframe::App for ZapretHubApp {
                             self.status_monitor.request_refresh();
                             self.last_message = "Запросил обновление статуса.".to_owned();
                         }
+                        let toggle_hover = if self.runtime_is_active() {
+                            "Остановить winws, Telegram proxy, сервис и связанные процессы."
+                        } else {
+                            "Запустить выбранный основной профиль."
+                        };
+                        if ui
+                            .add_enabled(
+                                self.runtime_toggle_enabled(),
+                                egui::Button::new(self.runtime_toggle_label()),
+                            )
+                            .on_hover_text(toggle_hover)
+                            .clicked()
+                        {
+                            self.toggle_runtime();
+                        }
                     });
                 });
+                ui.add_space(10.0);
+                self.draw_tab_bar(ui);
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    let stacked = ui.available_width() < 980.0;
-
-                    if stacked {
-                        self.draw_overview(ui);
-                        ui.add_space(12.0);
-                        self.draw_primary_actions(ui);
-                        ui.add_space(12.0);
-                        self.draw_profiles(ui);
-                        ui.add_space(12.0);
-                        self.draw_service_tools(ui);
-                        ui.add_space(12.0);
-                        self.draw_installation_info(ui);
-                        ui.add_space(12.0);
-                        self.draw_status_log(ui);
-                    } else {
-                        ui.columns(2, |columns| {
-                            self.draw_overview(&mut columns[0]);
-                            self.draw_primary_actions(&mut columns[1]);
-                        });
-                        ui.add_space(12.0);
-                        ui.columns(2, |columns| {
-                            self.draw_profiles(&mut columns[0]);
-                            self.draw_service_tools(&mut columns[1]);
-                        });
-                        ui.add_space(12.0);
-                        ui.columns(2, |columns| {
-                            self.draw_installation_info(&mut columns[0]);
-                            self.draw_status_log(&mut columns[1]);
-                        });
-                    }
+                    self.draw_current_tab(ui);
                 });
         });
     }
@@ -1253,15 +1963,17 @@ impl StatusMonitor {
         let (status_sender, receiver) = mpsc::channel();
         let (command_sender, command_receiver) = mpsc::channel();
 
-        thread::spawn(move || loop {
-            let status = refresh_runtime_status(&bundle_path);
-            let _ = status_sender.send(status);
-            ctx.request_repaint();
+        thread::spawn(move || {
+            loop {
+                let status = refresh_runtime_status(&bundle_path);
+                let _ = status_sender.send(status);
+                ctx.request_repaint();
 
-            match command_receiver.recv_timeout(Duration::from_secs(2)) {
-                Ok(StatusCommand::Refresh) => continue,
-                Err(RecvTimeoutError::Timeout) => continue,
-                Err(RecvTimeoutError::Disconnected) => return,
+                match command_receiver.recv_timeout(Duration::from_secs(2)) {
+                    Ok(StatusCommand::Refresh) => continue,
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => return,
+                }
             }
         });
 
@@ -1277,11 +1989,7 @@ impl StatusMonitor {
 }
 
 fn yes_no(value: bool) -> &'static str {
-    if value {
-        "да"
-    } else {
-        "нет"
-    }
+    if value { "да" } else { "нет" }
 }
 
 fn author_build_label() -> String {
