@@ -162,7 +162,6 @@ fn select_bundle_asset(tag: &str, assets: Vec<GitHubAsset>) -> Option<GitHubAsse
     assets
         .into_iter()
         .find(|asset| asset.name.eq_ignore_ascii_case(&exact_name))
-        .or_else(|| None)
 }
 
 fn download_release_asset(release: &BundleRelease, zip_path: &Path) -> Result<()> {

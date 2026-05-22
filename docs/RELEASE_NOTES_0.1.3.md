@@ -8,6 +8,7 @@
 - Bundled `TG WS Proxy` is staged from the current upstream latest release, `v1.7.0`.
 - Updated release defaults and the legacy fallback bundle path to the `1.9.8c` bundle folder.
 - Added common GitHub web, API, asset, and raw-content domains to the packaged general hostlist.
+- Added an automatic VRChat preset that writes a managed game hostlist block to `lists/list-general-user.txt` when a profile starts.
 - Reworked the app into focused tabs and added in-app bundle update checks for future upstream releases.
 - Added the full upstream profile list, selectable persisted main profiles, and an in-app ipset refresh action for the current bundle.
 - Added startup-only soft notifications for app, Zapret bundle, and Tg proxy updates, with per-release dismissal and a global settings toggle.
@@ -33,6 +34,7 @@
 
 - `CF media` still requires a user-controlled Cloudflare domain in `Full setup`.
 - Telegram media and calls are not guaranteed for every chat or channel; this remains an upstream limitation of the current proxy approach.
+- The VRChat preset is domain-only. It does not add broad Cloudflare, AWS, or Photon IP ranges, and UDP realtime behavior can still vary by ISP and upstream profile.
 - AndroidHub is not part of this Windows installer release.
 
 ## Artifacts

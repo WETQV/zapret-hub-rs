@@ -18,8 +18,21 @@ const MANAGED_WHITELIST_START: &str = "# Zapret Hub managed whitelist start";
 const MANAGED_WHITELIST_END: &str = "# Zapret Hub managed whitelist end";
 const MANAGED_CF_MEDIA_START: &str = "# Zapret Hub managed cf media start";
 const MANAGED_CF_MEDIA_END: &str = "# Zapret Hub managed cf media end";
+const MANAGED_VRCHAT_START: &str = "# Zapret Hub managed VRChat start";
+const MANAGED_VRCHAT_END: &str = "# Zapret Hub managed VRChat end";
 const BUILTIN_WHITELIST_FILE_NAME: &str = "builtin-whitelist.txt";
 const EMBEDDED_BUILTIN_WHITELIST: &str = include_str!("../../assets/builtin-whitelist.txt");
+const VRCHAT_HOSTLIST_ENTRIES: &[&str] = &[
+    "vrchat.com",
+    "api.vrchat.cloud",
+    "files.vrchat.cloud",
+    "assets.vrchat.com",
+    "vrcpm.vrchat.cloud",
+    "*.vrcdn.cloud",
+    "*.vrcdn.live",
+    "*.vrcdn.video",
+    "dbinj8iahsbec.cloudfront.net",
+];
 const TELEGRAM_PROXY_SCRIPT_NAME: &str = "telegram_proxy.cmd";
 const TELEGRAM_PROXY_SILENT_SCRIPT_NAME: &str = "start_telegram_proxy_silent.cmd";
 pub(crate) const TELEGRAM_PROXY_LOG_FILE_NAME: &str = "tgproxy-runtime.log";
@@ -76,9 +89,12 @@ impl BundleAction {
                 use_builtin_whitelist,
             } => {
                 if use_builtin_whitelist {
-                    format!("{} profile started with whitelist", profile.label())
+                    format!(
+                        "{} profile started with whitelist and VRChat preset",
+                        profile.label()
+                    )
                 } else {
-                    format!("{} profile started", profile.label())
+                    format!("{} profile started with VRChat preset", profile.label())
                 }
             }
             Self::StopAll => "all known bypass processes stopped".to_owned(),
@@ -154,6 +170,7 @@ fn start_profile(
         ));
     }
 
+    sync_vrchat_hostlist(bundle_path)?;
     sync_cf_media_hostlist(bundle_path, telegram_proxy)?;
 
     if telegram_proxy.enabled {
@@ -549,6 +566,31 @@ fn sync_cf_media_hostlist(
     Ok(())
 }
 
+fn sync_vrchat_hostlist(bundle_path: &Path) -> Result<()> {
+    let list_path = bundle_path.join("lists").join("list-general-user.txt");
+    let existing_content = if list_path.is_file() {
+        fs::read_to_string(&list_path)?
+    } else {
+        String::new()
+    };
+    let vrchat_domains = vrchat_domains();
+
+    let updated_content = apply_managed_block(
+        &existing_content,
+        &vrchat_domains,
+        true,
+        MANAGED_VRCHAT_START,
+        MANAGED_VRCHAT_END,
+    );
+
+    if let Some(parent) = list_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    fs::write(list_path, updated_content)?;
+    Ok(())
+}
+
 fn cf_media_domains(domain: &str) -> Vec<String> {
     let mut domains = Vec::with_capacity(7);
     domains.push(domain.to_owned());
@@ -556,6 +598,13 @@ fn cf_media_domains(domain: &str) -> Vec<String> {
         domains.push(format!("{suffix}.{domain}"));
     }
     domains
+}
+
+fn vrchat_domains() -> Vec<String> {
+    VRCHAT_HOSTLIST_ENTRIES
+        .iter()
+        .map(|entry| (*entry).to_owned())
+        .collect()
 }
 
 fn apply_managed_block(
@@ -681,6 +730,67 @@ mod tests {
                 .all(|script_name| script_name.starts_with("general")
                     && script_name.ends_with(".bat"))
         );
+    }
+
+    #[test]
+    fn vrchat_hostlist_is_added_once() {
+        let bundle_dir = unique_temp_dir("zapret-hub-vrchat-once-test");
+        let profile_path = bundle_dir.join("lists").join("list-general-user.txt");
+
+        sync_vrchat_hostlist(&bundle_dir).expect("vrchat hostlist synced");
+        sync_vrchat_hostlist(&bundle_dir).expect("vrchat hostlist synced again");
+
+        let content = fs::read_to_string(profile_path).expect("hostlist read");
+        assert_eq!(content.matches(MANAGED_VRCHAT_START).count(), 1);
+        assert_eq!(content.matches("api.vrchat.cloud").count(), 1);
+        assert!(content.contains("dbinj8iahsbec.cloudfront.net"));
+
+        fs::remove_dir_all(bundle_dir).expect("temp bundle removed");
+    }
+
+    #[test]
+    fn vrchat_hostlist_preserves_user_entries() {
+        let bundle_dir = unique_temp_dir("zapret-hub-vrchat-user-test");
+        let lists_dir = bundle_dir.join("lists");
+        fs::create_dir_all(&lists_dir).expect("lists dir created");
+        fs::write(
+            lists_dir.join("list-general-user.txt"),
+            "custom.example\r\n\r\n",
+        )
+        .expect("user hostlist written");
+
+        sync_vrchat_hostlist(&bundle_dir).expect("vrchat hostlist synced");
+
+        let content =
+            fs::read_to_string(lists_dir.join("list-general-user.txt")).expect("hostlist read");
+        assert!(content.starts_with("custom.example\r\n\r\n"));
+        assert!(content.contains(MANAGED_VRCHAT_START));
+        assert!(content.contains("*.vrcdn.cloud"));
+
+        fs::remove_dir_all(bundle_dir).expect("temp bundle removed");
+    }
+
+    #[test]
+    fn vrchat_and_cf_media_blocks_coexist() {
+        let bundle_dir = unique_temp_dir("zapret-hub-vrchat-cf-test");
+        let telegram_proxy = TelegramProxyLaunchConfig {
+            enabled: true,
+            mode: TelegramProxyMode::CfMedia,
+            cf_domain: "media.example".to_owned(),
+        };
+
+        sync_vrchat_hostlist(&bundle_dir).expect("vrchat hostlist synced");
+        sync_cf_media_hostlist(&bundle_dir, &telegram_proxy).expect("cf media synced");
+        sync_vrchat_hostlist(&bundle_dir).expect("vrchat hostlist synced again");
+
+        let content = fs::read_to_string(bundle_dir.join("lists").join("list-general-user.txt"))
+            .expect("hostlist read");
+        assert_eq!(content.matches(MANAGED_VRCHAT_START).count(), 1);
+        assert_eq!(content.matches(MANAGED_CF_MEDIA_START).count(), 1);
+        assert!(content.contains("api.vrchat.cloud"));
+        assert!(content.contains("kws203.media.example"));
+
+        fs::remove_dir_all(bundle_dir).expect("temp bundle removed");
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {

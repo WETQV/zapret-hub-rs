@@ -75,6 +75,12 @@ Zapret Hub/
 
 Подробная инструкция с точными DNS-записями и проверками: [docs/TELEGRAM_CF_MEDIA.md](docs/TELEGRAM_CF_MEDIA.md).
 
+## VRChat preset
+
+Zapret Hub automatically adds a managed VRChat block to `lists/list-general-user.txt` whenever a profile starts. The preset covers the main VRChat game endpoints, CDN hostnames, and asset hosts used for login, API requests, worlds, and avatars.
+
+The preset intentionally does not add broad Cloudflare, AWS, or Photon IP ranges to `ipset-all.txt`. Those ranges are shared and change often, so the safer v1 behavior is domain-only hostlist management. UDP realtime paths can still depend on the user's ISP and the current upstream zapret strategy.
+
 ## Структура репозитория
 
 ```text

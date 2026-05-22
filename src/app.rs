@@ -356,11 +356,11 @@ impl ZapretHubApp {
         }
 
         let telegram_proxy = self.telegram_proxy_launch_config();
-        if matches!(action, BundleAction::StartProfile { .. }) {
-            if let Err(error) = self.validate_telegram_proxy_config(&telegram_proxy) {
-                self.last_message = format!("Telegram proxy не запущен: {error}");
-                return;
-            }
+        if matches!(action, BundleAction::StartProfile { .. })
+            && let Err(error) = self.validate_telegram_proxy_config(&telegram_proxy)
+        {
+            self.last_message = format!("Telegram proxy не запущен: {error}");
+            return;
         }
 
         let bundle_path = self.bundle_path.clone();
@@ -810,11 +810,11 @@ impl ZapretHubApp {
     fn profile_launch_caption(&self, profile_name: &str) -> String {
         if self.app_config.launch_telegram_proxy_for_profiles {
             format!(
-                "Запускает {profile_name} и Telegram WS proxy в режиме {}.",
+                "Запускает {profile_name}, Telegram WS proxy в режиме {} и VRChat preset.",
                 self.telegram_proxy_mode_label(self.app_config.telegram_proxy_mode.clone())
             )
         } else {
-            format!("Запускает {profile_name} без Telegram WS proxy.")
+            format!("Запускает {profile_name} без Telegram WS proxy, с VRChat preset.")
         }
     }
 
@@ -1034,15 +1034,15 @@ impl ZapretHubApp {
                     let button_width = (ui.available_width() - 370.0).max(180.0);
                     let start_caption = if self.app_config.use_builtin_whitelist {
                         if self.app_config.launch_telegram_proxy_for_profiles {
-                            "Запускает выбранный основной профиль, Telegram WS proxy и добавляет встроенный список исключений."
+                            "Запускает выбранный основной профиль, Telegram WS proxy, VRChat preset и добавляет встроенный список исключений."
                         } else {
-                            "Запускает выбранный основной профиль и добавляет встроенный список исключений."
+                            "Запускает выбранный основной профиль, VRChat preset и добавляет встроенный список исключений."
                         }
                     } else {
                         if self.app_config.launch_telegram_proxy_for_profiles {
-                            "Запускает выбранный основной профиль и Telegram WS proxy."
+                            "Запускает выбранный основной профиль, Telegram WS proxy и VRChat preset."
                         } else {
-                            "Запускает выбранный основной профиль без Telegram WS proxy."
+                            "Запускает выбранный основной профиль без Telegram WS proxy, с VRChat preset."
                         }
                     };
 
@@ -1198,7 +1198,7 @@ impl ZapretHubApp {
                 ui.add_space(8.0);
                 ui.label(
                     RichText::new(
-                        "Telegram Desktop 6.7.2 и новее обычно не требуют автоматического запуска Telegram WS proxy вместе с профилем.",
+                        "Telegram Desktop 6.7.2 и новее обычно не требуют автоматического запуска Telegram WS proxy вместе с профилем. VRChat preset применяется автоматически.",
                     )
                     .color(Color32::from_gray(120)),
                 );
@@ -1853,11 +1853,14 @@ impl BundleAction {
             } => {
                 if use_builtin_whitelist {
                     format!(
-                        "Запускаю основной профиль {} со встроенным списком исключений.",
+                        "Запускаю основной профиль {} со встроенным списком исключений и VRChat preset.",
                         profile.label()
                     )
                 } else {
-                    format!("Запускаю основной профиль {}.", profile.label())
+                    format!(
+                        "Запускаю основной профиль {} с VRChat preset.",
+                        profile.label()
+                    )
                 }
             }
             BundleAction::StopAll => "Останавливаю bypass, proxy и связанные процессы.".to_owned(),
