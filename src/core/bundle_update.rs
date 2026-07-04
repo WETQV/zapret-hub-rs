@@ -1,4 +1,6 @@
 use std::fs;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -18,6 +20,12 @@ const BUNDLE_RELEASE_API_URL: &str =
     "https://api.github.com/repos/Flowseal/zapret-discord-youtube/releases/latest";
 const USER_AGENT: &str = "zapret-hub-rs/0.1";
 const BUNDLE_VERSION_FILE_NAME: &str = "ZapretBundle.version.json";
+const SHA256SUMS_FILE_NAME: &str = "SHA256SUMS.txt";
+const TG_PROXY_ASSET_NAME: &str = "TgWsProxy_windows.exe";
+const TG_PROXY_VERSION_FILE_NAME: &str = "TgWsProxy_windows.version.json";
+const UPSTREAM_UPDATE_CHECK_FLAG_RELATIVE_PATH: &str = "utils/check_updates.enabled";
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 const GITHUB_HOSTLIST_ENTRIES: &[&str] = &[
     "github.com",
@@ -58,6 +66,20 @@ pub(crate) struct BundleUpdateStatus {
     pub(crate) update_available: bool,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedBundleUpdate {
+    pub(crate) release: BundleRelease,
+    pub(crate) work_dir: PathBuf,
+    pub(crate) staged_bundle: PathBuf,
+    pub(crate) warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BundleUpdateOutcome {
+    pub(crate) message: String,
+    pub(crate) warnings: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct GitHubRelease {
     tag_name: String,
@@ -90,28 +112,71 @@ pub(crate) fn check_for_update(bundle_path: &Path) -> Result<BundleUpdateStatus>
     })
 }
 
-pub(crate) fn install_update(bundle_path: &Path, release: &BundleRelease) -> Result<String> {
+pub(crate) fn prepare_update(
+    bundle_path: &Path,
+    release: &BundleRelease,
+) -> Result<PreparedBundleUpdate> {
     let work_dir = unique_work_dir()?;
     fs::create_dir_all(&work_dir)
         .with_context(|| format!("failed to create {}", work_dir.display()))?;
 
-    let result = install_update_in_work_dir(bundle_path, release, &work_dir);
-    let cleanup_result = fs::remove_dir_all(&work_dir);
-
-    match (result, cleanup_result) {
-        (Ok(message), _) => Ok(message),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(cleanup_error)) => {
-            Err(error).with_context(|| format!("also failed to remove {}", cleanup_error))
+    match prepare_update_in_work_dir(bundle_path, release, &work_dir) {
+        Ok(prepared) => Ok(prepared),
+        Err(error) => {
+            let cleanup_result = fs::remove_dir_all(&work_dir);
+            if let Err(cleanup_error) = cleanup_result {
+                return Err(error)
+                    .with_context(|| format!("also failed to remove {}", cleanup_error));
+            }
+            Err(error)
         }
     }
 }
 
-fn install_update_in_work_dir(
+pub(crate) fn apply_prepared_update(
+    bundle_path: &Path,
+    prepared: &PreparedBundleUpdate,
+) -> Result<BundleUpdateOutcome> {
+    if !prepared.staged_bundle.is_dir() {
+        anyhow::bail!(
+            "prepared bundle is missing: {}",
+            prepared.staged_bundle.display()
+        );
+    }
+
+    preserve_user_files(bundle_path, &prepared.staged_bundle)?;
+
+    if !is_valid_bundle_dir(&prepared.staged_bundle) {
+        anyhow::bail!("prepared bundle failed validation");
+    }
+
+    swap_bundle(bundle_path, &prepared.staged_bundle)?;
+
+    let mut warnings = prepared.warnings.clone();
+    if let Err(error) = discard_prepared_update(prepared) {
+        warnings.push(format!("prepared update cleanup failed: {error}"));
+    }
+
+    Ok(BundleUpdateOutcome {
+        message: format!("Bundle updated to {}.", prepared.release.tag),
+        warnings,
+    })
+}
+
+pub(crate) fn discard_prepared_update(prepared: &PreparedBundleUpdate) -> Result<()> {
+    if prepared.work_dir.exists() {
+        fs::remove_dir_all(&prepared.work_dir)
+            .with_context(|| format!("failed to remove {}", prepared.work_dir.display()))?;
+    }
+
+    Ok(())
+}
+
+fn prepare_update_in_work_dir(
     bundle_path: &Path,
     release: &BundleRelease,
     work_dir: &Path,
-) -> Result<String> {
+) -> Result<PreparedBundleUpdate> {
     let zip_path = work_dir.join(&release.asset_name);
     let extract_dir = work_dir.join("extract");
     let staged_bundle = work_dir.join("bundle");
@@ -120,10 +185,14 @@ fn install_update_in_work_dir(
     expand_zip(&zip_path, &extract_dir)?;
     let source_bundle = find_source_bundle_root(&extract_dir)?;
     copy_dir_recursive(&source_bundle, &staged_bundle)?;
-    stage_bundle(&staged_bundle, release, bundle_path)?;
-    swap_bundle(bundle_path, &staged_bundle)?;
+    let warnings = stage_bundle(&staged_bundle, release, bundle_path)?;
 
-    Ok(format!("Bundle updated to {}.", release.tag))
+    Ok(PreparedBundleUpdate {
+        release: release.clone(),
+        work_dir: work_dir.to_owned(),
+        staged_bundle,
+        warnings,
+    })
 }
 
 fn fetch_latest_release() -> Result<BundleRelease> {
@@ -200,7 +269,7 @@ fn expand_zip(zip_path: &Path, extract_dir: &Path) -> Result<()> {
     fs::create_dir_all(extract_dir)
         .with_context(|| format!("failed to create {}", extract_dir.display()))?;
 
-    let status = Command::new("powershell")
+    let status = background_command("powershell")
         .arg("-NoProfile")
         .arg("-ExecutionPolicy")
         .arg("Bypass")
@@ -216,6 +285,13 @@ fn expand_zip(zip_path: &Path, extract_dir: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn background_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
 }
 
 fn find_source_bundle_root(extract_dir: &Path) -> Result<PathBuf> {
@@ -248,29 +324,66 @@ fn stage_bundle(
     staged_bundle: &Path,
     release: &BundleRelease,
     current_bundle: &Path,
-) -> Result<()> {
+) -> Result<Vec<String>> {
+    stage_bundle_with_tg_proxy_installer(
+        staged_bundle,
+        release,
+        current_bundle,
+        install_latest_tg_proxy,
+    )
+}
+
+fn stage_bundle_with_tg_proxy_installer<F>(
+    staged_bundle: &Path,
+    release: &BundleRelease,
+    current_bundle: &Path,
+    install_tg_proxy: F,
+) -> Result<Vec<String>>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    let mut warnings = Vec::new();
+
     write_bundle_version_metadata(staged_bundle, &release.tag)?;
-    install_latest_tg_proxy(staged_bundle)?;
+    preserve_existing_tg_proxy(current_bundle, staged_bundle)?;
+    if let Err(error) = install_tg_proxy(staged_bundle) {
+        warnings.push(format!("Telegram WS proxy was not updated: {error}"));
+    }
     ensure_hub_scripts(staged_bundle)?;
     patch_profile_scripts(staged_bundle)?;
+    disable_upstream_update_checks(staged_bundle)?;
     add_hostlist_entries(
         staged_bundle
             .join("lists")
             .join("list-general.txt")
             .as_path(),
     )?;
-    preserve_user_files(current_bundle, staged_bundle)?;
 
     if !is_valid_bundle_dir(staged_bundle) {
         anyhow::bail!("staged bundle failed validation");
     }
 
-    Ok(())
+    Ok(warnings)
 }
 
 fn install_latest_tg_proxy(staged_bundle: &Path) -> Result<()> {
     let status = check_tg_proxy_update(staged_bundle)?;
     install_tg_proxy_update(staged_bundle, &status.latest)?;
+    Ok(())
+}
+
+fn preserve_existing_tg_proxy(current_bundle: &Path, staged_bundle: &Path) -> Result<()> {
+    for file_name in [TG_PROXY_ASSET_NAME, TG_PROXY_VERSION_FILE_NAME] {
+        let source = current_bundle.join(file_name);
+        if !source.is_file() {
+            continue;
+        }
+
+        fs::copy(&source, staged_bundle.join(file_name)).with_context(|| {
+            format!("failed to preserve {} into staged bundle", source.display())
+        })?;
+    }
+
     Ok(())
 }
 
@@ -337,13 +450,20 @@ start "" "%ROOT%\{profile_script}"
 }
 
 fn patch_profile_scripts(bundle_root: &Path) -> Result<()> {
-    for script_name in [
-        "general (SIMPLE FAKE ALT2).bat",
-        "general (ALT11).bat",
-        "general (FAKE TLS AUTO ALT3).bat",
-        "general (ALT7).bat",
-    ] {
-        let script_path = bundle_root.join(script_name);
+    for entry in fs::read_dir(bundle_root)
+        .with_context(|| format!("failed to read {}", bundle_root.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+
+        let script_name = entry.file_name().to_string_lossy().to_string();
+        if !is_profile_script_name(&script_name) {
+            continue;
+        }
+
+        let script_path = entry.path();
         let content = fs::read_to_string(&script_path)
             .with_context(|| format!("failed to read {}", script_path.display()))?;
         let updated = content.replace(
@@ -355,6 +475,64 @@ fn patch_profile_scripts(bundle_root: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn is_profile_script_name(script_name: &str) -> bool {
+    let lower = script_name.to_ascii_lowercase();
+    lower.starts_with("general") && lower.ends_with(".bat")
+}
+
+fn disable_upstream_update_checks(bundle_root: &Path) -> Result<()> {
+    let flag_path = bundle_root.join("utils").join("check_updates.enabled");
+    match fs::remove_file(&flag_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to remove {}", flag_path.display()));
+        }
+    }
+
+    remove_sha256sum_entry(bundle_root, UPSTREAM_UPDATE_CHECK_FLAG_RELATIVE_PATH)
+}
+
+fn remove_sha256sum_entry(bundle_root: &Path, relative_path: &str) -> Result<()> {
+    let checksums_path = bundle_root.join(SHA256SUMS_FILE_NAME);
+    if !checksums_path.is_file() {
+        return Ok(());
+    }
+
+    let content = fs::read_to_string(&checksums_path)
+        .with_context(|| format!("failed to read {}", checksums_path.display()))?;
+    let mut changed = false;
+    let mut lines = Vec::new();
+
+    for line in content.lines() {
+        if sha256sum_line_targets(line, relative_path) {
+            changed = true;
+            continue;
+        }
+        lines.push(line);
+    }
+
+    if changed {
+        let mut updated = lines.join("\n");
+        if content.ends_with('\n') {
+            updated.push('\n');
+        }
+        fs::write(&checksums_path, updated)
+            .with_context(|| format!("failed to write {}", checksums_path.display()))?;
+    }
+
+    Ok(())
+}
+
+fn sha256sum_line_targets(line: &str, relative_path: &str) -> bool {
+    let Some(path) = line.split_whitespace().last() else {
+        return false;
+    };
+    let normalized = path.replace('\\', "/");
+    let relative_path = relative_path.trim_start_matches("./");
+    normalized == relative_path || normalized == format!("./{relative_path}")
 }
 
 pub(crate) fn add_hostlist_entries(list_path: &Path) -> Result<usize> {
@@ -558,51 +736,145 @@ pause
 
 fn remove_service_script() -> &'static str {
     r#"@echo off
+setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 > nul
 cd /d "%~dp0"
 
-sc query zapret > nul 2>&1
-if not errorlevel 1 (
-    net stop zapret > nul 2>&1
-    sc delete zapret > nul 2>&1
+set "FAILED="
+
+call :stop_service zapret
+call :kill_process winws.exe
+call :kill_process TgWsProxy_windows.exe
+call :stop_service WinDivert
+call :stop_service WinDivert14
+call :verify_service_stopped zapret
+call :verify_process_stopped winws.exe
+call :verify_process_stopped TgWsProxy_windows.exe
+call :verify_service_stopped WinDivert
+call :verify_service_stopped WinDivert14
+
+if defined FAILED (
+    echo Failed to stop: !FAILED!
+    exit /b 1
 )
 
-tasklist /FI "IMAGENAME eq winws.exe" | find /I "winws.exe" > nul
-if not errorlevel 1 (
-    taskkill /IM winws.exe /F > nul 2>&1
-)
-
-sc stop WinDivert > nul 2>&1
-sc stop WinDivert14 > nul 2>&1
+sc delete zapret > nul 2>&1
+sc delete WinDivert > nul 2>&1
+sc delete WinDivert14 > nul 2>&1
 
 echo Service removal command completed.
+exit /b 0
+
+:stop_service
+sc query "%~1" > nul 2>&1
+if errorlevel 1 exit /b 0
+net stop "%~1" > nul 2>&1
+for /l %%I in (1,1,10) do (
+    sc query "%~1" 2>nul | findstr /I "RUNNING STOP_PENDING" > nul
+    if errorlevel 1 exit /b 0
+    timeout /t 1 /nobreak > nul
+)
+sc stop "%~1" > nul 2>&1
+exit /b 0
+
+:kill_process
+for /l %%I in (1,1,3) do (
+    tasklist /FI "IMAGENAME eq %~1" | find /I "%~1" > nul
+    if errorlevel 1 exit /b 0
+    taskkill /IM "%~1" /T /F > nul 2>&1
+    timeout /t 1 /nobreak > nul
+)
+exit /b 0
+
+:verify_service_stopped
+sc query "%~1" > nul 2>&1
+if errorlevel 1 exit /b 0
+sc query "%~1" 2>nul | findstr /I "RUNNING STOP_PENDING" > nul
+if not errorlevel 1 call :append_failure "service %~1"
+exit /b 0
+
+:verify_process_stopped
+tasklist /FI "IMAGENAME eq %~1" | find /I "%~1" > nul
+if not errorlevel 1 call :append_failure "process %~1"
+exit /b 0
+
+:append_failure
+if defined FAILED (
+    set "FAILED=!FAILED!; %~1"
+) else (
+    set "FAILED=%~1"
+)
+exit /b 0
 "#
 }
 
 fn stop_all_script() -> &'static str {
     r#"@echo off
+setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 > nul
 cd /d "%~dp0"
 
-sc query zapret > nul 2>&1
-if not errorlevel 1 (
-    net stop zapret > nul 2>&1
-)
+set "FAILED="
 
-tasklist /FI "IMAGENAME eq winws.exe" | find /I "winws.exe" > nul
-if not errorlevel 1 (
-    taskkill /IM winws.exe /F > nul 2>&1
-)
+call :stop_service zapret
+call :kill_process winws.exe
+call :kill_process TgWsProxy_windows.exe
+call :stop_service WinDivert
+call :stop_service WinDivert14
+call :verify_service_stopped zapret
+call :verify_process_stopped winws.exe
+call :verify_process_stopped TgWsProxy_windows.exe
+call :verify_service_stopped WinDivert
+call :verify_service_stopped WinDivert14
 
-tasklist /FI "IMAGENAME eq TgWsProxy_windows.exe" | find /I "TgWsProxy_windows.exe" > nul
-if not errorlevel 1 (
-    taskkill /IM TgWsProxy_windows.exe /F > nul 2>&1
+if defined FAILED (
+    echo Failed to stop: !FAILED!
+    exit /b 1
 )
-
-sc stop WinDivert > nul 2>&1
-sc stop WinDivert14 > nul 2>&1
 
 echo Bypass processes were stopped.
+exit /b 0
+
+:stop_service
+sc query "%~1" > nul 2>&1
+if errorlevel 1 exit /b 0
+net stop "%~1" > nul 2>&1
+for /l %%I in (1,1,10) do (
+    sc query "%~1" 2>nul | findstr /I "RUNNING STOP_PENDING" > nul
+    if errorlevel 1 exit /b 0
+    timeout /t 1 /nobreak > nul
+)
+sc stop "%~1" > nul 2>&1
+exit /b 0
+
+:kill_process
+for /l %%I in (1,1,3) do (
+    tasklist /FI "IMAGENAME eq %~1" | find /I "%~1" > nul
+    if errorlevel 1 exit /b 0
+    taskkill /IM "%~1" /T /F > nul 2>&1
+    timeout /t 1 /nobreak > nul
+)
+exit /b 0
+
+:verify_service_stopped
+sc query "%~1" > nul 2>&1
+if errorlevel 1 exit /b 0
+sc query "%~1" 2>nul | findstr /I "RUNNING STOP_PENDING" > nul
+if not errorlevel 1 call :append_failure "service %~1"
+exit /b 0
+
+:verify_process_stopped
+tasklist /FI "IMAGENAME eq %~1" | find /I "%~1" > nul
+if not errorlevel 1 call :append_failure "process %~1"
+exit /b 0
+
+:append_failure
+if defined FAILED (
+    set "FAILED=!FAILED!; %~1"
+) else (
+    set "FAILED=%~1"
+)
+exit /b 0
 "#
 }
 
@@ -709,6 +981,132 @@ mod tests {
     }
 
     #[test]
+    fn stage_bundle_does_not_copy_user_lists_before_apply() -> Result<()> {
+        let root = temp_root("zapret-hub-stage-no-preserve-test")?;
+        let current = root.join("bundle");
+        let staged = root.join("work").join("bundle");
+        write_current_bundle_user_file(&current, "before prepare")?;
+        write_minimal_source_bundle(&staged)?;
+
+        let warnings =
+            stage_bundle_with_tg_proxy_installer(&staged, &test_release(), &current, |_| Ok(()))?;
+
+        assert!(warnings.is_empty());
+        assert_eq!(
+            fs::read_to_string(current.join("lists").join("list-general-user.txt"))?,
+            "before prepare"
+        );
+        assert!(!staged.join("lists").join("list-general-user.txt").exists());
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn stage_bundle_disables_upstream_auto_update_checks() -> Result<()> {
+        let root = temp_root("zapret-hub-disable-upstream-updates-test")?;
+        let current = root.join("bundle");
+        let staged = root.join("work").join("bundle");
+        write_minimal_source_bundle(&staged)?;
+
+        stage_bundle_with_tg_proxy_installer(&staged, &test_release(), &current, |_| Ok(()))?;
+
+        assert!(!staged.join("utils").join("check_updates.enabled").exists());
+        assert!(
+            !fs::read_to_string(staged.join(SHA256SUMS_FILE_NAME))?
+                .contains("check_updates.enabled")
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn stage_bundle_patches_all_profile_launchers() -> Result<()> {
+        let root = temp_root("zapret-hub-profile-patch-test")?;
+        let current = root.join("bundle");
+        let staged = root.join("work").join("bundle");
+        write_minimal_source_bundle(&staged)?;
+
+        stage_bundle_with_tg_proxy_installer(&staged, &test_release(), &current, |_| Ok(()))?;
+
+        for script_name in [
+            "general (SIMPLE FAKE ALT2).bat",
+            "general (ALT11).bat",
+            "general (ALT12).bat",
+            "general.bat",
+        ] {
+            let content = fs::read_to_string(staged.join(script_name))?;
+            assert!(content.contains(r#"start "" /B "%BIN%winws.exe""#));
+            assert!(!content.contains(r#"start "zapret: %~n0" /min "%BIN%winws.exe""#));
+        }
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn apply_prepared_update_preserves_user_files_changed_after_prepare() -> Result<()> {
+        let root = temp_root("zapret-hub-apply-preserve-test")?;
+        let current = root.join("bundle");
+        let work_dir = root.join("work");
+        let staged = work_dir.join("bundle");
+        write_current_bundle_user_file(&current, "before prepare")?;
+        write_minimal_source_bundle(&staged)?;
+        stage_bundle_with_tg_proxy_installer(&staged, &test_release(), &current, |_| Ok(()))?;
+
+        write_current_bundle_user_file(&current, "changed after prepare")?;
+        let prepared = PreparedBundleUpdate {
+            release: test_release(),
+            work_dir: work_dir.clone(),
+            staged_bundle: staged,
+            warnings: Vec::new(),
+        };
+
+        let outcome = apply_prepared_update(&current, &prepared)?;
+
+        assert_eq!(outcome.message, "Bundle updated to 1.9.9a.");
+        assert_eq!(
+            fs::read_to_string(current.join("lists").join("list-general-user.txt"))?,
+            "changed after prepare"
+        );
+        assert!(!work_dir.exists());
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn stage_bundle_keeps_existing_tg_proxy_when_update_fails() -> Result<()> {
+        let root = temp_root("zapret-hub-tg-warning-test")?;
+        let current = root.join("bundle");
+        let staged = root.join("work").join("bundle");
+        write_current_bundle_user_file(&current, "user file")?;
+        fs::write(current.join(TG_PROXY_ASSET_NAME), "old proxy")?;
+        fs::write(current.join(TG_PROXY_VERSION_FILE_NAME), "old version")?;
+        write_minimal_source_bundle(&staged)?;
+
+        let warnings =
+            stage_bundle_with_tg_proxy_installer(&staged, &test_release(), &current, |_| {
+                anyhow::bail!("network unavailable")
+            })?;
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("network unavailable"));
+        assert_eq!(
+            fs::read_to_string(staged.join(TG_PROXY_ASSET_NAME))?,
+            "old proxy"
+        );
+        assert_eq!(
+            fs::read_to_string(staged.join(TG_PROXY_VERSION_FILE_NAME))?,
+            "old version"
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
     fn swap_bundle_replaces_current_bundle_and_removes_backup() -> Result<()> {
         let root = env::temp_dir().join(format!("zapret-hub-swap-test-{}", timestamp()?));
         let current = root.join("bundle");
@@ -735,6 +1133,64 @@ mod tests {
         }));
 
         fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    fn test_release() -> BundleRelease {
+        BundleRelease {
+            tag: "1.9.9a".to_owned(),
+            release_url: "https://example.test/release".to_owned(),
+            asset_url: "https://example.test/bundle.zip".to_owned(),
+            asset_name: "zapret-discord-youtube-1.9.9a.zip".to_owned(),
+            digest: None,
+        }
+    }
+
+    fn temp_root(prefix: &str) -> Result<PathBuf> {
+        let root = env::temp_dir().join(format!("{prefix}-{}", timestamp()?));
+        fs::create_dir_all(&root)?;
+        Ok(root)
+    }
+
+    fn write_current_bundle_user_file(bundle: &Path, content: &str) -> Result<()> {
+        let lists_dir = bundle.join("lists");
+        fs::create_dir_all(&lists_dir)?;
+        fs::write(lists_dir.join("list-general-user.txt"), content)?;
+        Ok(())
+    }
+
+    fn write_minimal_source_bundle(bundle: &Path) -> Result<()> {
+        fs::create_dir_all(bundle.join("bin"))?;
+        fs::create_dir_all(bundle.join("lists"))?;
+        fs::create_dir_all(bundle.join("utils"))?;
+        fs::write(bundle.join("service.bat"), "@echo off\r\n")?;
+        fs::write(
+            bundle.join("utils").join("check_updates.enabled"),
+            "ENABLED\r\n",
+        )?;
+        fs::write(
+            bundle.join(SHA256SUMS_FILE_NAME),
+            "abc  ./utils/check_updates.enabled\nabc  ./service.bat\n",
+        )?;
+        fs::write(
+            bundle.join("lists").join("list-general.txt"),
+            "discord.com\r\n",
+        )?;
+        for script_name in [
+            "general (SIMPLE FAKE ALT2).bat",
+            "general (ALT11).bat",
+            "general (ALT12).bat",
+            "general (FAKE TLS AUTO ALT3).bat",
+            "general (ALT7).bat",
+            "general.bat",
+        ] {
+            fs::write(
+                bundle.join(script_name),
+                r#"@echo off
+start "zapret: %~n0" /min "%BIN%winws.exe"
+"#,
+            )?;
+        }
         Ok(())
     }
 }

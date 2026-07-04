@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use eframe::egui;
 use eframe::egui::{Align, Color32, CornerRadius, RichText, Stroke, Vec2};
@@ -10,33 +10,41 @@ use crate::LaunchMode;
 use crate::core::autostart;
 use crate::core::build_info::{APP_AUTHOR, APP_NAME, APP_VERSION, BUILD_DATE, BUILT_BY};
 use crate::core::bundle_metadata::detect_bundle_version;
+use crate::core::bundle_test::{
+    BundleTestSummary, bundle_test_script_path, read_latest_bundle_test_result, start_bundle_test,
+};
 use crate::core::bundle_update::{
-    BundleRelease, BundleUpdateStatus, check_for_update as check_bundle_update,
-    install_update as install_bundle_update,
+    BundleRelease, BundleUpdateOutcome, BundleUpdateStatus, PreparedBundleUpdate,
+    apply_prepared_update as apply_bundle_update, check_for_update as check_bundle_update,
+    discard_prepared_update as discard_bundle_update, prepare_update as prepare_bundle_update,
 };
-use crate::core::config::{
-    AppConfig, TelegramProxyMode, ZapretProfile, load_app_config, save_app_config,
-};
+use crate::core::config::{AppConfig, TelegramProxyMode, load_app_config, save_app_config};
 use crate::core::paths::{ResolvedPaths, is_valid_bundle_dir, resolve_paths};
 use crate::core::status::{RuntimeStatus, ServiceState, refresh_runtime_status};
 use crate::core::tg_proxy_update::{
     TelegramProxyRelease, TelegramProxyUpdateStatus, check_for_update as check_tg_proxy_update,
     install_update as install_tg_proxy_update,
 };
-use crate::zapret::bundle::{BundleAction, TelegramProxyLaunchConfig, run_action};
+use crate::zapret::bundle::{
+    BundleAction, BundleProfile, TelegramProxyLaunchConfig, discover_profiles,
+    find_profile_by_script, run_action,
+};
 
 pub(crate) struct ZapretHubApp {
     bundle_path: PathBuf,
     bundle_source: String,
     bundle_version: Option<String>,
+    profiles: Vec<BundleProfile>,
     status: RuntimeStatus,
-    last_profile: Option<&'static str>,
+    last_profile: Option<String>,
     last_message: String,
     startup_notices: Vec<StartupNotice>,
     pending_action: Option<PendingAction>,
     bundle_task: Option<PendingBundleUpdateTask>,
     bundle_status: Option<BundleUpdateStatus>,
+    prepared_bundle_update: Option<PreparedBundleUpdate>,
     bundle_check_error: Option<String>,
+    bundle_test: BundleTestState,
     tg_proxy_task: Option<PendingTelegramProxyTask>,
     tg_proxy_status: Option<TelegramProxyUpdateStatus>,
     tg_proxy_check_error: Option<String>,
@@ -65,7 +73,8 @@ struct PendingBundleUpdateTask {
 
 enum BundleUpdateTask {
     Check(UpdateCheckReason),
-    Install(BundleRelease),
+    Prepare(BundleRelease),
+    Apply(PreparedBundleUpdate),
 }
 
 enum TelegramProxyTask {
@@ -101,12 +110,20 @@ enum StartupNoticeAction {
 
 enum BundleUpdateTaskResult {
     Checked(BundleUpdateStatus),
-    Installed(String),
+    Prepared(PreparedBundleUpdate),
+    Applied(BundleUpdateOutcome),
 }
 
 enum TelegramProxyTaskResult {
     Checked(TelegramProxyUpdateStatus),
     Installed(String),
+}
+
+#[derive(Default)]
+struct BundleTestState {
+    launched_after: Option<SystemTime>,
+    summary: Option<BundleTestSummary>,
+    error: Option<String>,
 }
 
 struct StatusMonitor {
@@ -167,6 +184,51 @@ impl AppTab {
     }
 }
 
+fn reconcile_main_profile_script(app_config: &mut AppConfig, profiles: &[BundleProfile]) -> bool {
+    let selected = app_config.main_profile_script_or_legacy().to_owned();
+    if profiles.iter().any(|profile| {
+        profile
+            .script_name()
+            .eq_ignore_ascii_case(selected.as_str())
+    }) {
+        if app_config.main_profile_script.is_some() {
+            return false;
+        }
+        app_config.main_profile_script = Some(selected);
+        return true;
+    }
+
+    let legacy_script = app_config.main_profile.script_name();
+    let fallback = profiles
+        .iter()
+        .find(|profile| profile.script_name().eq_ignore_ascii_case(legacy_script))
+        .or_else(|| profiles.first())
+        .map(|profile| profile.script_name().to_owned());
+
+    if app_config.main_profile_script == fallback {
+        return false;
+    }
+
+    app_config.main_profile_script = fallback;
+    true
+}
+
+fn warnings_text(warnings: &[String]) -> String {
+    if warnings.is_empty() {
+        String::new()
+    } else {
+        format!(" Предупреждение: {}", warnings.join("; "))
+    }
+}
+
+fn bundle_update_outcome_message(outcome: &BundleUpdateOutcome) -> String {
+    format!(
+        "{}{}",
+        outcome.message,
+        warnings_text(outcome.warnings.as_slice())
+    )
+}
+
 impl ZapretHubApp {
     pub(crate) fn new(cc: &eframe::CreationContext<'_>, launch_mode: LaunchMode) -> Self {
         apply_custom_style(&cc.egui_ctx);
@@ -206,6 +268,18 @@ impl ZapretHubApp {
         }
 
         let bundle_version = detect_bundle_version(&bundle_dir);
+        let profiles = match discover_profiles(&bundle_dir) {
+            Ok(profiles) => profiles,
+            Err(error) => {
+                last_message = format!("Не удалось прочитать профили bundle: {error}");
+                Vec::new()
+            }
+        };
+        let profile_selection_changed =
+            reconcile_main_profile_script(&mut app_config, profiles.as_slice());
+        if profile_selection_changed && let Err(error) = save_app_config(&app_config) {
+            last_message = format!("Основной профиль выбран, но настройки не сохранены: {error}");
+        }
         let mut startup_notices = Vec::new();
         if app_config.startup_notifications_enabled
             && app_config.last_seen_app_version.as_deref() != Some(APP_VERSION)
@@ -223,6 +297,7 @@ impl ZapretHubApp {
             bundle_path: bundle_dir,
             bundle_source: source.to_owned(),
             bundle_version,
+            profiles,
             status,
             last_profile: None,
             last_message,
@@ -230,7 +305,9 @@ impl ZapretHubApp {
             pending_action: None,
             bundle_task: None,
             bundle_status: None,
+            prepared_bundle_update: None,
             bundle_check_error: None,
+            bundle_test: BundleTestState::default(),
             tg_proxy_task: None,
             tg_proxy_status: None,
             tg_proxy_check_error: None,
@@ -262,6 +339,38 @@ impl ZapretHubApp {
         self.app_config.selected_tab = tab.id().to_owned();
         if let Err(error) = save_app_config(&self.app_config) {
             self.last_message = format!("Не удалось сохранить выбранную вкладку: {error}");
+        }
+    }
+
+    fn selected_profile(&self) -> Option<BundleProfile> {
+        let selected_script = self.app_config.main_profile_script_or_legacy();
+        self.profiles
+            .iter()
+            .find(|profile| profile.script_name().eq_ignore_ascii_case(selected_script))
+            .or_else(|| self.profiles.first())
+            .cloned()
+    }
+
+    fn selected_profile_label(&self) -> String {
+        self.selected_profile()
+            .map(|profile| profile.label().to_owned())
+            .unwrap_or_else(|| "не выбран".to_owned())
+    }
+
+    fn refresh_profiles(&mut self) {
+        match discover_profiles(&self.bundle_path) {
+            Ok(profiles) => {
+                self.profiles = profiles;
+                let changed =
+                    reconcile_main_profile_script(&mut self.app_config, self.profiles.as_slice());
+                if changed && let Err(error) = save_app_config(&self.app_config) {
+                    self.last_message =
+                        format!("Профили обновлены, но настройки не сохранены: {error}");
+                }
+            }
+            Err(error) => {
+                self.last_message = format!("Не удалось обновить список профилей: {error}");
+            }
         }
     }
 
@@ -329,12 +438,12 @@ impl ZapretHubApp {
         };
     }
 
-    fn set_main_profile(&mut self, profile: ZapretProfile) {
-        if self.app_config.main_profile == profile {
+    fn set_main_profile(&mut self, profile: &BundleProfile) {
+        if self.app_config.main_profile_script.as_deref() == Some(profile.script_name()) {
             return;
         }
 
-        self.app_config.main_profile = profile;
+        self.app_config.main_profile_script = Some(profile.script_name().to_owned());
         if let Err(error) = save_app_config(&self.app_config) {
             self.last_message = format!("Не удалось сохранить основной профиль: {error}");
         } else {
@@ -343,10 +452,66 @@ impl ZapretHubApp {
     }
 
     fn start_selected_profile(&mut self) {
+        let Some(profile) = self.selected_profile() else {
+            self.last_message = "В текущем bundle не найдены general*.bat профили.".to_owned();
+            return;
+        };
+
         self.start_action(BundleAction::StartProfile {
-            profile: self.app_config.main_profile,
+            profile,
             use_builtin_whitelist: self.app_config.use_builtin_whitelist,
         });
+    }
+
+    fn start_bundle_test_run(&mut self) {
+        if let Some(blocker) = self.bundle_test_blocker() {
+            self.last_message = blocker;
+            return;
+        }
+
+        let launched_after = SystemTime::now();
+        match start_bundle_test(&self.bundle_path, launched_after) {
+            Ok(()) => {
+                self.bundle_test.launched_after = Some(launched_after);
+                self.bundle_test.summary = None;
+                self.bundle_test.error = None;
+                self.last_message =
+                    "Тест профилей запущен. Завершите сценарий в окне PowerShell.".to_owned();
+            }
+            Err(error) => {
+                self.bundle_test.error = Some(error.to_string());
+                self.last_message = format!("Не удалось запустить тест профилей: {error}");
+            }
+        }
+    }
+
+    fn poll_bundle_test_result(&mut self) {
+        let Some(launched_after) = self.bundle_test.launched_after else {
+            return;
+        };
+
+        if self.bundle_test.summary.is_some() || self.bundle_test.error.is_some() {
+            return;
+        }
+
+        match read_latest_bundle_test_result(&self.bundle_path, launched_after) {
+            Ok(Some(summary)) => {
+                let best = summary
+                    .best_strategy
+                    .as_deref()
+                    .unwrap_or("не определён")
+                    .to_owned();
+                self.bundle_test.summary = Some(summary);
+                self.bundle_test.launched_after = None;
+                self.last_message = format!("Тест профилей завершён. Лучший профиль: {best}.");
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.bundle_test.error = Some(error.to_string());
+                self.bundle_test.launched_after = None;
+                self.last_message = format!("Не удалось прочитать результат теста: {error}");
+            }
+        }
     }
 
     fn start_action(&mut self, action: BundleAction) {
@@ -356,13 +521,15 @@ impl ZapretHubApp {
         }
 
         let telegram_proxy = self.telegram_proxy_launch_config();
-        if matches!(action, BundleAction::StartProfile { .. })
+        if matches!(&action, BundleAction::StartProfile { .. })
             && let Err(error) = self.validate_telegram_proxy_config(&telegram_proxy)
         {
             self.last_message = format!("Telegram proxy не запущен: {error}");
             return;
         }
 
+        let in_progress_label = action.in_progress_label();
+        let pending_action = action.clone();
         let bundle_path = self.bundle_path.clone();
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
@@ -370,8 +537,11 @@ impl ZapretHubApp {
             let _ = sender.send(result);
         });
 
-        self.last_message = action.in_progress_label();
-        self.pending_action = Some(PendingAction { action, receiver });
+        self.last_message = in_progress_label;
+        self.pending_action = Some(PendingAction {
+            action: pending_action,
+            receiver,
+        });
         self.status_monitor.request_refresh();
     }
 
@@ -426,7 +596,7 @@ impl ZapretHubApp {
     }
 
     fn start_bundle_update(&mut self) {
-        if self.bundle_task.is_some() || self.runtime_is_active() {
+        if self.bundle_task.is_some() {
             return;
         }
 
@@ -445,22 +615,66 @@ impl ZapretHubApp {
         }
 
         let release = status.latest;
-        let install_release = release.clone();
+        let prepare_release = release.clone();
         let bundle_path = self.bundle_path.clone();
         let repaint_ctx = self.repaint_ctx.clone();
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
-            let result = install_bundle_update(&bundle_path, &install_release)
-                .map(BundleUpdateTaskResult::Installed);
+            let result = prepare_bundle_update(&bundle_path, &prepare_release)
+                .map(BundleUpdateTaskResult::Prepared);
             let _ = sender.send(result);
             repaint_ctx.request_repaint();
         });
 
-        self.last_message = format!("Обновляю bundle до {}.", release.tag);
+        self.last_message = format!("Скачиваю и подготавливаю bundle {}.", release.tag);
         self.bundle_task = Some(PendingBundleUpdateTask {
-            task: BundleUpdateTask::Install(release),
+            task: BundleUpdateTask::Prepare(release),
             receiver,
         });
+    }
+
+    fn start_apply_prepared_bundle_update(&mut self) {
+        if self.bundle_task.is_some() || self.runtime_is_active() {
+            return;
+        }
+
+        let Some(prepared) = self.prepared_bundle_update.clone() else {
+            self.last_message = "Сначала скачайте и подготовьте bundle.".to_owned();
+            return;
+        };
+
+        let apply_prepared = prepared.clone();
+        let bundle_path = self.bundle_path.clone();
+        let repaint_ctx = self.repaint_ctx.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = apply_bundle_update(&bundle_path, &apply_prepared)
+                .map(BundleUpdateTaskResult::Applied);
+            let _ = sender.send(result);
+            repaint_ctx.request_repaint();
+        });
+
+        self.last_message = format!("Применяю bundle {}.", prepared.release.tag);
+        self.bundle_task = Some(PendingBundleUpdateTask {
+            task: BundleUpdateTask::Apply(prepared),
+            receiver,
+        });
+    }
+
+    fn discard_prepared_bundle_update(&mut self) {
+        let Some(prepared) = self.prepared_bundle_update.take() else {
+            return;
+        };
+
+        match discard_bundle_update(&prepared) {
+            Ok(()) => {
+                self.last_message =
+                    format!("Подготовленный bundle {} удалён.", prepared.release.tag);
+            }
+            Err(error) => {
+                self.last_message = format!("Не удалось удалить подготовленный bundle: {error}");
+            }
+        }
     }
 
     fn start_tg_proxy_update(&mut self) {
@@ -586,15 +800,17 @@ impl ZapretHubApp {
         if let Some(pending) = &self.pending_action {
             match pending.receiver.try_recv() {
                 Ok(result) => {
-                    let action = pending.action;
+                    let action = pending.action.clone();
                     self.pending_action = None;
 
                     match result {
                         Ok(message) => {
                             self.last_profile = match action {
-                                BundleAction::StartProfile { profile, .. } => Some(profile.label()),
+                                BundleAction::StartProfile { ref profile, .. } => {
+                                    Some(profile.label().to_owned())
+                                }
                                 BundleAction::StopAll | BundleAction::RemoveService => None,
-                                _ => self.last_profile,
+                                _ => self.last_profile.clone(),
                             };
                             self.last_message = self.describe_action_result(action, message);
                             self.status_monitor.request_refresh();
@@ -678,8 +894,11 @@ impl ZapretHubApp {
                 Ok(result) => {
                     let task = match &pending.task {
                         BundleUpdateTask::Check(reason) => BundleUpdateTask::Check(*reason),
-                        BundleUpdateTask::Install(release) => {
-                            BundleUpdateTask::Install(release.clone())
+                        BundleUpdateTask::Prepare(release) => {
+                            BundleUpdateTask::Prepare(release.clone())
+                        }
+                        BundleUpdateTask::Apply(prepared) => {
+                            BundleUpdateTask::Apply(prepared.clone())
                         }
                     };
                     self.bundle_task = None;
@@ -692,9 +911,19 @@ impl ZapretHubApp {
                             self.bundle_status = Some(status);
                             self.bundle_check_error = None;
                         }
-                        Ok(BundleUpdateTaskResult::Installed(message)) => {
-                            self.last_message = message;
+                        Ok(BundleUpdateTaskResult::Prepared(prepared)) => {
+                            let warning_text = warnings_text(prepared.warnings.as_slice());
+                            self.last_message = format!(
+                                "Bundle {} скачан и готов к установке.{warning_text}",
+                                prepared.release.tag
+                            );
+                            self.prepared_bundle_update = Some(prepared);
+                        }
+                        Ok(BundleUpdateTaskResult::Applied(outcome)) => {
+                            self.last_message = bundle_update_outcome_message(&outcome);
+                            self.prepared_bundle_update = None;
                             self.bundle_version = detect_bundle_version(&self.bundle_path);
+                            self.refresh_profiles();
                             self.app_config.dismissed_bundle_release_tag = None;
                             let _ = save_app_config(&self.app_config);
                             self.start_bundle_update_check();
@@ -707,8 +936,11 @@ impl ZapretHubApp {
                                 BundleUpdateTask::Check(_) => {
                                     format!("Не удалось проверить обновление bundle: {error}")
                                 }
-                                BundleUpdateTask::Install(_) => {
-                                    format!("Не удалось обновить bundle: {error}")
+                                BundleUpdateTask::Prepare(_) => {
+                                    format!("Не удалось скачать и подготовить bundle: {error}")
+                                }
+                                BundleUpdateTask::Apply(_) => {
+                                    format!("Не удалось применить bundle: {error}")
                                 }
                             };
                             if was_check {
@@ -755,8 +987,14 @@ impl ZapretHubApp {
             )
     }
 
+    fn bundle_test_waiting(&self) -> bool {
+        self.bundle_test.launched_after.is_some()
+            && self.bundle_test.summary.is_none()
+            && self.bundle_test.error.is_none()
+    }
+
     fn profile_actions_enabled(&self) -> bool {
-        self.pending_action.is_none() && !self.runtime_is_active()
+        self.pending_action.is_none() && !self.runtime_is_active() && !self.bundle_test_waiting()
     }
 
     fn stop_action_enabled(&self) -> bool {
@@ -764,12 +1002,14 @@ impl ZapretHubApp {
     }
 
     fn service_tools_enabled(&self) -> bool {
-        self.pending_action.is_none() && !self.runtime_is_active()
+        self.pending_action.is_none() && !self.runtime_is_active() && !self.bundle_test_waiting()
     }
 
     fn runtime_lock_message(&self) -> Option<&'static str> {
         if self.pending_action.is_some() {
             Some("Дождитесь завершения текущей команды.")
+        } else if self.bundle_test_waiting() {
+            Some("Дождитесь завершения теста профилей.")
         } else if self.runtime_is_active() {
             Some("Сначала остановите текущий профиль.")
         } else {
@@ -790,9 +1030,7 @@ impl ZapretHubApp {
     fn describe_action_result(&self, action: BundleAction, action_message: String) -> String {
         match action {
             BundleAction::StopAll => {
-                format!(
-                    "{action_message}. Если что-то ещё останавливается, статус обновится автоматически."
-                )
+                format!("{action_message}. Проверил, что runtime больше не активен.")
             }
             BundleAction::RemoveService => {
                 format!("{action_message}. Удаление сервиса и очистка WinDivert были запрошены.")
@@ -841,6 +1079,20 @@ impl ZapretHubApp {
         }
 
         Ok(())
+    }
+
+    fn bundle_test_blocker(&self) -> Option<String> {
+        if self.pending_action.is_some() || self.bundle_task.is_some() {
+            return Some("Дождитесь завершения текущей команды.".to_owned());
+        }
+        if self.runtime_is_active() {
+            return Some("Остановите текущий профиль или сервис перед тестом bundle.".to_owned());
+        }
+        if !bundle_test_script_path(&self.bundle_path).is_file() {
+            return Some("В текущем bundle нет utils\\test zapret.ps1.".to_owned());
+        }
+
+        None
     }
 
     fn set_telegram_proxy_mode(&mut self, mode: TelegramProxyMode) {
@@ -900,18 +1152,22 @@ impl ZapretHubApp {
     }
 
     fn bundle_update_controls_enabled(&self) -> bool {
+        self.pending_action.is_none() && self.bundle_task.is_none()
+    }
+
+    fn prepared_bundle_apply_enabled(&self) -> bool {
         self.pending_action.is_none() && self.bundle_task.is_none() && !self.runtime_is_active()
     }
 
     fn runtime_toggle_enabled(&self) -> bool {
-        self.pending_action.is_none() && self.bundle_task.is_none()
+        self.pending_action.is_none() && self.bundle_task.is_none() && !self.bundle_test_waiting()
     }
 
     fn runtime_toggle_label(&self) -> String {
         if self.runtime_is_active() {
             "Выключить".to_owned()
         } else {
-            format!("Включить {}", self.app_config.main_profile.label())
+            format!("Включить {}", self.selected_profile_label())
         }
     }
 
@@ -1009,8 +1265,8 @@ impl ZapretHubApp {
                     "Сервис zapret",
                     Self::service_text(self.status.service_state),
                 );
-                Self::status_row(ui, "Основной профиль", self.app_config.main_profile.label());
-                if let Some(profile) = self.last_profile {
+                Self::status_row(ui, "Основной профиль", self.selected_profile_label());
+                if let Some(profile) = &self.last_profile {
                     Self::status_row(ui, "Последний профиль", profile);
                 }
             });
@@ -1052,7 +1308,7 @@ impl ZapretHubApp {
                             egui::Button::new(
                                 RichText::new(format!(
                                     "Запустить {}",
-                                    self.app_config.main_profile.label()
+                                    self.selected_profile_label()
                                 ))
                                 .strong(),
                             )
@@ -1221,18 +1477,29 @@ impl ZapretHubApp {
                     ui.add_space(8.0);
                 }
 
-                let profiles = ZapretProfile::ALL;
+                if self.profiles.is_empty() {
+                    ui.label(
+                        RichText::new("В текущем bundle не найдены general*.bat профили.")
+                            .color(Color32::from_rgb(198, 120, 0)),
+                    );
+                    return;
+                }
+
+                let profiles = self.profiles.clone();
                 ui.columns(column_count, |columns| {
                     for (index, profile) in profiles.iter().enumerate() {
                         let column = &mut columns[index % column_count];
                         column.horizontal(|ui| {
-                            let selected = self.app_config.main_profile == *profile;
+                            let selected = self
+                                .app_config
+                                .main_profile_script_or_legacy()
+                                .eq_ignore_ascii_case(profile.script_name());
                             let response = ui.add_enabled(
                                 can_select,
                                 egui::RadioButton::new(selected, profile.label()),
                             );
                             if response.clicked() {
-                                self.set_main_profile(*profile);
+                                self.set_main_profile(profile);
                             }
 
                             if selected {
@@ -1247,12 +1514,117 @@ impl ZapretHubApp {
                 if Self::primary_button(
                     ui,
                     "Запустить выбранный профиль",
-                    &self.profile_launch_caption(self.app_config.main_profile.label()),
+                    &self.profile_launch_caption(self.selected_profile_label().as_str()),
                     can_start,
                 )
                 .clicked()
                 {
                     self.start_selected_profile();
+                }
+            },
+        );
+    }
+
+    fn draw_bundle_tests(&mut self, ui: &mut egui::Ui) {
+        Self::card(
+            ui,
+            "Тест профилей",
+            "Запускает upstream тест из bundle и показывает лучший найденный профиль.",
+            |ui| {
+                let blocker = self.bundle_test_blocker();
+                let waiting = self.bundle_test.launched_after.is_some()
+                    && self.bundle_test.summary.is_none()
+                    && self.bundle_test.error.is_none();
+
+                Self::status_row(
+                    ui,
+                    "Скрипт",
+                    bundle_test_script_path(&self.bundle_path)
+                        .display()
+                        .to_string(),
+                );
+
+                if let Some(blocker) = &blocker {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(blocker).color(Color32::from_rgb(198, 120, 0)));
+                }
+
+                ui.add_space(10.0);
+                if ui
+                    .add_enabled(
+                        blocker.is_none() && !waiting,
+                        egui::Button::new("Запустить тест профилей"),
+                    )
+                    .on_hover_text(
+                        "Откроет PowerShell с utils\\test zapret.ps1 из текущего bundle.",
+                    )
+                    .clicked()
+                {
+                    self.start_bundle_test_run();
+                }
+
+                if waiting {
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Жду файл результата из utils\\test results.");
+                    });
+                }
+
+                if let Some(error) = &self.bundle_test.error {
+                    ui.add_space(10.0);
+                    ui.label(RichText::new(error).color(Color32::from_rgb(198, 120, 0)));
+                }
+
+                if let Some(summary) = self.bundle_test.summary.clone() {
+                    ui.add_space(12.0);
+                    Self::status_row(ui, "Результат", summary.result_path.display().to_string());
+                    let best = summary.best_strategy.as_deref().unwrap_or("не определён");
+                    Self::status_row(ui, "Лучший профиль", best);
+
+                    if let Some(best_strategy) = summary.best_strategy.as_deref() {
+                        match find_profile_by_script(&self.bundle_path, best_strategy) {
+                            Ok(Some(profile)) => {
+                                if ui
+                                    .add_enabled(
+                                        self.pending_action.is_none(),
+                                        egui::Button::new("Сделать основным"),
+                                    )
+                                    .on_hover_text("Сохранит лучший профиль как основной.")
+                                    .clicked()
+                                {
+                                    self.set_main_profile(&profile);
+                                }
+                            }
+                            Ok(None) => {
+                                ui.label(
+                                    RichText::new("Лучший профиль не найден в текущем bundle.")
+                                        .color(Color32::from_gray(120)),
+                                );
+                            }
+                            Err(error) => {
+                                ui.label(
+                                    RichText::new(format!("Не удалось проверить профиль: {error}"))
+                                        .color(Color32::from_rgb(198, 120, 0)),
+                                );
+                            }
+                        }
+                    }
+
+                    ui.add_space(10.0);
+                    for config in summary.configs.iter().take(6) {
+                        Self::status_row(
+                            ui,
+                            config.config.as_str(),
+                            format!("{}: {}", config.test_type, config.analytics),
+                        );
+                    }
+                    if summary.configs.len() > 6 {
+                        ui.label(
+                            RichText::new("Остальные строки сохранены в файле результата.")
+                                .color(Color32::from_gray(120)),
+                        );
+                    }
                 }
             },
         );
@@ -1582,7 +1954,52 @@ impl ZapretHubApp {
                     Self::status_row(ui, "Страница релиза", status.latest.release_url.as_str());
                     Self::status_row(ui, "Asset", status.latest.asset_name.as_str());
 
-                    if status.update_available {
+                    if let Some(prepared) = self.prepared_bundle_update.clone() {
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "Bundle {} скачан и готов к установке.",
+                                prepared.release.tag
+                            ))
+                            .color(Color32::from_rgb(0, 110, 174)),
+                        );
+                        for warning in &prepared.warnings {
+                            ui.label(RichText::new(warning).color(Color32::from_rgb(198, 120, 0)));
+                        }
+
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    self.prepared_bundle_apply_enabled(),
+                                    egui::Button::new("Применить bundle"),
+                                )
+                                .on_hover_text("Заменит текущий bundle подготовленной версией.")
+                                .clicked()
+                            {
+                                self.start_apply_prepared_bundle_update();
+                            }
+
+                            if ui
+                                .add_enabled(
+                                    self.bundle_task.is_none(),
+                                    egui::Button::new("Удалить подготовку"),
+                                )
+                                .on_hover_text("Удалит скачанный staged bundle из временной папки.")
+                                .clicked()
+                            {
+                                self.discard_prepared_bundle_update();
+                            }
+                        });
+
+                        if !self.prepared_bundle_apply_enabled() {
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new("Остановите текущий профиль, сервис и Telegram proxy перед заменой bundle.")
+                                    .color(Color32::from_gray(120)),
+                            );
+                        }
+                    } else if status.update_available {
                         let dismissed = self.app_config.dismissed_bundle_release_tag.as_deref()
                             == Some(status.latest.tag.as_str());
 
@@ -1607,9 +2024,11 @@ impl ZapretHubApp {
                             if ui
                                 .add_enabled(
                                     can_update && !dismissed,
-                                    egui::Button::new("Обновить bundle"),
+                                    egui::Button::new("Скачать bundle"),
                                 )
-                                .on_hover_text("Скачает официальный zip Flowseal, подготовит hub scripts и заменит bundle.")
+                                .on_hover_text(
+                                    "Скачает официальный zip Flowseal и подготовит staged bundle.",
+                                )
                                 .clicked()
                             {
                                 self.start_bundle_update();
@@ -1625,14 +2044,6 @@ impl ZapretHubApp {
                                 self.dismiss_bundle_release(&status.latest.tag);
                             }
                         });
-
-                        if !self.bundle_update_controls_enabled() {
-                            ui.add_space(8.0);
-                            ui.label(
-                                RichText::new("Остановите текущий профиль, сервис и Telegram proxy перед обновлением bundle.")
-                                    .color(Color32::from_gray(120)),
-                            );
-                        }
                     } else {
                         ui.add_space(8.0);
                         ui.label(
@@ -1828,7 +2239,11 @@ impl ZapretHubApp {
                 ui.add_space(12.0);
                 self.draw_status_log(ui);
             }
-            AppTab::Profiles => self.draw_profiles(ui),
+            AppTab::Profiles => {
+                self.draw_profiles(ui);
+                ui.add_space(12.0);
+                self.draw_bundle_tests(ui);
+            }
             AppTab::Telegram => {
                 self.draw_telegram_settings(ui);
                 ui.add_space(12.0);
@@ -1845,13 +2260,13 @@ impl ZapretHubApp {
 }
 
 impl BundleAction {
-    fn in_progress_label(self) -> String {
+    fn in_progress_label(&self) -> String {
         match self {
             BundleAction::StartProfile {
                 profile,
                 use_builtin_whitelist,
             } => {
-                if use_builtin_whitelist {
+                if *use_builtin_whitelist {
                     format!(
                         "Запускаю основной профиль {} со встроенным списком исключений и VRChat preset.",
                         profile.label()
@@ -1877,6 +2292,7 @@ impl eframe::App for ZapretHubApp {
         self.poll_action_completion();
         self.poll_tg_proxy_task_completion();
         self.poll_bundle_task_completion();
+        self.poll_bundle_test_result();
         self.poll_status_updates();
 
         if self.launch_mode.is_autostart() && !self.startup_view_applied {
@@ -1891,16 +2307,22 @@ impl eframe::App for ZapretHubApp {
         if self.pending_action.is_some()
             || self.tg_proxy_task.is_some()
             || self.bundle_task.is_some()
+            || self.bundle_test.launched_after.is_some()
         {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 
         if ctx.input(|i| i.viewport().close_requested()) {
-            if self.pending_action.is_some() || self.bundle_task.is_some() {
+            if self.pending_action.is_some()
+                || self.bundle_task.is_some()
+                || self.bundle_test_waiting()
+            {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.last_message = if self.bundle_task.is_some() {
                     "Сначала дождитесь завершения обновления bundle, потом закрывайте окно."
                         .to_owned()
+                } else if self.bundle_test_waiting() {
+                    "Сначала дождитесь завершения теста профилей, потом закрывайте окно.".to_owned()
                 } else {
                     "Сначала дождитесь завершения текущей команды, потом закрывайте окно."
                         .to_owned()

@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
-use crate::core::config::{TelegramProxyMode, ZapretProfile};
+use crate::core::config::TelegramProxyMode;
 use crate::core::process::{
     run_hidden_batch_wait, run_hidden_command_output, run_hidden_command_wait,
     run_visible_batch_detached, try_run_hidden_command,
@@ -44,6 +44,31 @@ const TELEGRAM_PROXY_CONFIG_DIR_NAME: &str = "TgWsProxy";
 const TELEGRAM_PROXY_CONFIG_FILE_NAME: &str = "config.json";
 const TELEGRAM_PROXY_DEFAULT_SECRET: &str = "6c3c7e85fc245242b3d113cfe307b520";
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BundleProfile {
+    script_name: String,
+    label: String,
+}
+
+impl BundleProfile {
+    pub(crate) fn new(script_name: String) -> Option<Self> {
+        if !is_profile_script_name(&script_name) {
+            return None;
+        }
+
+        let label = profile_label_from_script_name(&script_name);
+        Some(Self { script_name, label })
+    }
+
+    pub(crate) fn script_name(&self) -> &str {
+        &self.script_name
+    }
+
+    pub(crate) fn label(&self) -> &str {
+        &self.label
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct TelegramProxyLaunchConfig {
     pub(crate) enabled: bool,
@@ -68,10 +93,10 @@ struct TelegramProxyAppDataConfig {
     secret: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BundleAction {
     StartProfile {
-        profile: ZapretProfile,
+        profile: BundleProfile,
         use_builtin_whitelist: bool,
     },
     StopAll,
@@ -82,13 +107,13 @@ pub(crate) enum BundleAction {
 }
 
 impl BundleAction {
-    fn label(self) -> String {
+    fn label(&self) -> String {
         match self {
             Self::StartProfile {
                 profile,
                 use_builtin_whitelist,
             } => {
-                if use_builtin_whitelist {
+                if *use_builtin_whitelist {
                     format!(
                         "{} profile started with whitelist and VRChat preset",
                         profile.label()
@@ -97,7 +122,7 @@ impl BundleAction {
                     format!("{} profile started with VRChat preset", profile.label())
                 }
             }
-            Self::StopAll => "all known bypass processes stopped".to_owned(),
+            Self::StopAll => "bypass, proxy and services stopped".to_owned(),
             Self::RefreshIpset => "ipset list refreshed from bundled backup".to_owned(),
             Self::InstallService => "service installer launched".to_owned(),
             Self::RemoveService => "service removal completed".to_owned(),
@@ -111,6 +136,8 @@ pub(crate) fn run_action(
     action: BundleAction,
     telegram_proxy: &TelegramProxyLaunchConfig,
 ) -> Result<String> {
+    let label = action.label();
+
     match action {
         BundleAction::StartProfile {
             profile,
@@ -128,33 +155,98 @@ pub(crate) fn run_action(
         BundleAction::OpenServiceManager => launch_visible_root_script(bundle_path, "service.bat")?,
     }
 
-    Ok(action.label())
+    Ok(label)
 }
 
-impl ZapretProfile {
-    fn script_name(self) -> &'static str {
-        match self {
-            Self::General => "general.bat",
-            Self::Alt => "general (ALT).bat",
-            Self::Alt2 => "general (ALT2).bat",
-            Self::Alt3 => "general (ALT3).bat",
-            Self::Alt4 => "general (ALT4).bat",
-            Self::Alt5 => "general (ALT5).bat",
-            Self::Alt6 => "general (ALT6).bat",
-            Self::Alt7 => "general (ALT7).bat",
-            Self::Alt8 => "general (ALT8).bat",
-            Self::Alt9 => "general (ALT9).bat",
-            Self::Alt10 => "general (ALT10).bat",
-            Self::Alt11 => "general (ALT11).bat",
-            Self::FakeTlsAuto => "general (FAKE TLS AUTO).bat",
-            Self::FakeTlsAutoAlt => "general (FAKE TLS AUTO ALT).bat",
-            Self::FakeTlsAutoAlt2 => "general (FAKE TLS AUTO ALT2).bat",
-            Self::FakeTlsAutoAlt3 => "general (FAKE TLS AUTO ALT3).bat",
-            Self::SimpleFake => "general (SIMPLE FAKE).bat",
-            Self::SimpleFakeAlt => "general (SIMPLE FAKE ALT).bat",
-            Self::SimpleFakeAlt2 => "general (SIMPLE FAKE ALT2).bat",
+pub(crate) fn discover_profiles(bundle_path: &Path) -> Result<Vec<BundleProfile>> {
+    if !bundle_path.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut profiles = Vec::new();
+    for entry in fs::read_dir(bundle_path)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let script_name = entry.file_name().to_string_lossy().to_string();
+        if let Some(profile) = BundleProfile::new(script_name) {
+            profiles.push(profile);
         }
     }
+
+    profiles.sort_by(|left, right| {
+        natural_sort_key(left.script_name()).cmp(&natural_sort_key(right.script_name()))
+    });
+    Ok(profiles)
+}
+
+pub(crate) fn find_profile_by_script(
+    bundle_path: &Path,
+    script_name: &str,
+) -> Result<Option<BundleProfile>> {
+    Ok(discover_profiles(bundle_path)?
+        .into_iter()
+        .find(|profile| profile.script_name().eq_ignore_ascii_case(script_name)))
+}
+
+fn is_profile_script_name(script_name: &str) -> bool {
+    let lower = script_name.to_ascii_lowercase();
+    lower.starts_with("general") && lower.ends_with(".bat")
+}
+
+fn profile_label_from_script_name(script_name: &str) -> String {
+    let stem = script_name
+        .strip_suffix(".bat")
+        .unwrap_or(script_name)
+        .trim();
+    if stem.eq_ignore_ascii_case("general") {
+        return "general".to_owned();
+    }
+
+    let label = stem
+        .strip_prefix("general")
+        .unwrap_or(stem)
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .trim();
+
+    if label.is_empty() {
+        stem.to_owned()
+    } else {
+        label.to_owned()
+    }
+}
+
+fn natural_sort_key(value: &str) -> String {
+    let mut key = String::with_capacity(value.len() + 8);
+    let mut digits = String::new();
+
+    for char in value.chars() {
+        if char.is_ascii_digit() {
+            digits.push(char);
+            continue;
+        }
+
+        if !digits.is_empty() {
+            push_padded_digits(&mut key, &digits);
+            digits.clear();
+        }
+        key.push(char.to_ascii_lowercase());
+    }
+
+    if !digits.is_empty() {
+        push_padded_digits(&mut key, &digits);
+    }
+
+    key
+}
+
+fn push_padded_digits(target: &mut String, digits: &str) {
+    target.push_str(&format!("{:0>8}", digits));
 }
 
 fn start_profile(
@@ -259,14 +351,24 @@ fn sync_telegram_proxy_appdata_config(telegram_proxy: &TelegramProxyLaunchConfig
         .ok()
         .and_then(|content| serde_json::from_str::<TelegramProxyAppDataConfig>(&content).ok());
 
+    let config = telegram_proxy_appdata_config(telegram_proxy, existing.as_ref());
+    let serialized = serde_json::to_string_pretty(&config)?;
+    fs::write(config_path, format!("{serialized}\n"))?;
+
+    Ok(())
+}
+
+fn telegram_proxy_appdata_config(
+    telegram_proxy: &TelegramProxyLaunchConfig,
+    existing: Option<&TelegramProxyAppDataConfig>,
+) -> TelegramProxyAppDataConfig {
     let secret = existing
-        .as_ref()
         .map(|config| config.secret.trim())
         .filter(|secret| !secret.is_empty())
         .unwrap_or(TELEGRAM_PROXY_DEFAULT_SECRET)
         .to_owned();
 
-    let config = match telegram_proxy.mode {
+    match telegram_proxy.mode {
         TelegramProxyMode::Standard => TelegramProxyAppDataConfig {
             port: 1080,
             host: "127.0.0.1".to_owned(),
@@ -280,7 +382,7 @@ fn sync_telegram_proxy_appdata_config(telegram_proxy: &TelegramProxyLaunchConfig
             log_max_mb: existing.as_ref().map_or(5, |config| config.log_max_mb),
             buf_kb: existing.as_ref().map_or(256, |config| config.buf_kb),
             pool_size: existing.as_ref().map_or(4, |config| config.pool_size),
-            check_updates: existing.as_ref().is_none_or(|config| config.check_updates),
+            check_updates: false,
             cfproxy: false,
             cfproxy_priority: false,
             cfproxy_domain: String::new(),
@@ -295,18 +397,13 @@ fn sync_telegram_proxy_appdata_config(telegram_proxy: &TelegramProxyLaunchConfig
             log_max_mb: existing.as_ref().map_or(5, |config| config.log_max_mb),
             buf_kb: existing.as_ref().map_or(256, |config| config.buf_kb),
             pool_size: existing.as_ref().map_or(4, |config| config.pool_size),
-            check_updates: existing.as_ref().is_none_or(|config| config.check_updates),
+            check_updates: false,
             cfproxy: true,
             cfproxy_priority: true,
             cfproxy_domain: telegram_proxy.cf_domain.trim().to_owned(),
             secret,
         },
-    };
-
-    let serialized = serde_json::to_string_pretty(&config)?;
-    fs::write(config_path, format!("{serialized}\n"))?;
-
-    Ok(())
+    }
 }
 
 fn telegram_proxy_appdata_config_path() -> Result<PathBuf> {
@@ -401,11 +498,19 @@ fn run_hidden_script(bundle_path: &Path, script_name: &str) -> Result<()> {
 }
 
 fn stop_runtime(bundle_path: &Path) -> Result<()> {
-    stop_service_if_present(bundle_path, "zapret")?;
-    kill_process_if_running(bundle_path, "winws.exe");
-    kill_process_if_running(bundle_path, "TgWsProxy_windows.exe");
-    let _ = stop_service_if_present(bundle_path, "WinDivert");
-    let _ = stop_service_if_present(bundle_path, "WinDivert14");
+    request_service_stop(bundle_path, "zapret");
+    request_process_stop(bundle_path, "winws.exe");
+    request_process_stop(bundle_path, "TgWsProxy_windows.exe");
+    request_service_stop(bundle_path, "WinDivert");
+    request_service_stop(bundle_path, "WinDivert14");
+
+    let remaining = remaining_runtime_items(bundle_path);
+    if !remaining.is_empty() {
+        return Err(anyhow!(
+            "не удалось полностью остановить runtime: {}",
+            remaining.join("; ")
+        ));
+    }
 
     Ok(())
 }
@@ -419,39 +524,103 @@ fn remove_service(bundle_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn stop_service_if_present(bundle_path: &Path, service_name: &str) -> Result<()> {
-    match query_service_state(bundle_path, service_name)? {
-        Some(ServiceState::Running | ServiceState::StopPending) => {
-            try_run_hidden_command("net", &["stop", service_name], bundle_path);
-            wait_for_service_stop(bundle_path, service_name)?;
-        }
-        Some(ServiceState::Stopped | ServiceState::NotInstalled | ServiceState::Unknown) | None => {
-        }
-    }
+fn request_service_stop(bundle_path: &Path, service_name: &str) {
+    let Ok(Some(ServiceState::Running | ServiceState::StopPending | ServiceState::Unknown)) =
+        query_service_state(bundle_path, service_name)
+    else {
+        return;
+    };
 
-    Ok(())
-}
-
-fn wait_for_service_stop(bundle_path: &Path, service_name: &str) -> Result<()> {
-    for _ in 0..8 {
-        match query_service_state(bundle_path, service_name)? {
-            Some(ServiceState::Stopped | ServiceState::NotInstalled) | None => return Ok(()),
-            _ => thread::sleep(Duration::from_millis(350)),
-        }
+    try_run_hidden_command("net", &["stop", service_name], bundle_path);
+    if wait_for_service_stop(bundle_path, service_name, 20) {
+        return;
     }
 
     try_run_hidden_command("sc", &["stop", service_name], bundle_path);
-    thread::sleep(Duration::from_millis(350));
+    let _ = wait_for_service_stop(bundle_path, service_name, 10);
+}
 
-    Ok(())
+fn wait_for_service_stop(bundle_path: &Path, service_name: &str, attempts: usize) -> bool {
+    for _ in 0..attempts {
+        match query_service_state(bundle_path, service_name) {
+            Ok(Some(ServiceState::Stopped | ServiceState::NotInstalled)) | Ok(None) => {
+                return true;
+            }
+            _ => thread::sleep(Duration::from_millis(500)),
+        }
+    }
+
+    false
 }
 
 fn delete_service_if_present(bundle_path: &Path, service_name: &str) {
     let _ = run_hidden_command_wait("sc", &["delete", service_name], bundle_path);
 }
 
-fn kill_process_if_running(bundle_path: &Path, image_name: &str) {
-    let _ = run_hidden_command_wait("taskkill", &["/IM", image_name, "/T", "/F"], bundle_path);
+fn request_process_stop(bundle_path: &Path, image_name: &str) {
+    for _ in 0..3 {
+        if !is_process_running(bundle_path, image_name) {
+            return;
+        }
+
+        try_run_hidden_command("taskkill", &["/IM", image_name, "/T", "/F"], bundle_path);
+        if wait_for_process_stop(bundle_path, image_name, 10) {
+            return;
+        }
+    }
+}
+
+fn wait_for_process_stop(bundle_path: &Path, image_name: &str, attempts: usize) -> bool {
+    for _ in 0..attempts {
+        if !is_process_running(bundle_path, image_name) {
+            return true;
+        }
+
+        thread::sleep(Duration::from_millis(300));
+    }
+
+    false
+}
+
+fn remaining_runtime_items(bundle_path: &Path) -> Vec<String> {
+    let mut remaining = Vec::new();
+
+    for service_name in ["zapret", "WinDivert", "WinDivert14"] {
+        match query_service_state(bundle_path, service_name) {
+            Ok(Some(ServiceState::Running | ServiceState::StopPending | ServiceState::Unknown)) => {
+                remaining.push(format!("service {service_name} is still active"));
+            }
+            Ok(Some(ServiceState::Stopped | ServiceState::NotInstalled)) | Ok(None) => {}
+            Err(error) => remaining.push(format!("service {service_name} check failed: {error}")),
+        }
+    }
+
+    for image_name in ["winws.exe", "TgWsProxy_windows.exe"] {
+        if is_process_running(bundle_path, image_name) {
+            remaining.push(format!("process {image_name} is still running"));
+        }
+    }
+
+    remaining
+}
+
+fn is_process_running(bundle_path: &Path, image_name: &str) -> bool {
+    let output = run_hidden_command_output(
+        "tasklist",
+        &["/FI", &format!("IMAGENAME eq {image_name}")],
+        bundle_path,
+    );
+
+    match output {
+        Ok(output) => tasklist_output_has_process(&output.stdout, image_name),
+        Err(_) => false,
+    }
+}
+
+fn tasklist_output_has_process(output: &[u8], image_name: &str) -> bool {
+    String::from_utf8_lossy(output)
+        .to_ascii_lowercase()
+        .contains(&image_name.to_ascii_lowercase())
 }
 
 fn query_service_state(bundle_path: &Path, service_name: &str) -> Result<Option<ServiceState>> {
@@ -713,23 +882,84 @@ mod tests {
     }
 
     #[test]
-    fn all_profiles_map_to_general_batch_files() {
-        let script_names: Vec<&str> = ZapretProfile::ALL
-            .iter()
-            .map(|profile| profile.script_name())
-            .collect();
+    fn discover_profiles_includes_new_upstream_profiles_and_excludes_service() {
+        let bundle_dir = unique_temp_dir("zapret-hub-profile-discovery-test");
+        fs::create_dir_all(&bundle_dir).expect("temp bundle created");
 
-        assert_eq!(script_names.len(), 19);
-        assert!(script_names.contains(&"general.bat"));
-        assert!(script_names.contains(&"general (ALT11).bat"));
-        assert!(script_names.contains(&"general (FAKE TLS AUTO ALT3).bat"));
-        assert!(script_names.contains(&"general (SIMPLE FAKE ALT2).bat"));
-        assert!(
-            script_names
-                .iter()
-                .all(|script_name| script_name.starts_with("general")
-                    && script_name.ends_with(".bat"))
+        for script_name in [
+            "service.bat",
+            "general (ALT2).bat",
+            "general (ALT12).bat",
+            "general.bat",
+            "not-general.bat",
+        ] {
+            fs::write(bundle_dir.join(script_name), "@echo off\r\n").expect("script written");
+        }
+
+        let profiles = discover_profiles(&bundle_dir).expect("profiles discovered");
+        let script_names: Vec<&str> = profiles.iter().map(BundleProfile::script_name).collect();
+
+        assert_eq!(
+            script_names,
+            vec!["general (ALT2).bat", "general (ALT12).bat", "general.bat"]
         );
+        assert_eq!(profiles[1].label(), "ALT12");
+
+        fs::remove_dir_all(bundle_dir).expect("temp bundle removed");
+    }
+
+    #[test]
+    fn tasklist_output_detects_running_process_by_image_name() {
+        let output =
+            b"Image Name                     PID Session Name        Session#    Mem Usage\r\n\
+winws.exe                    1234 Console                    1      1,024 K\r\n";
+
+        assert!(tasklist_output_has_process(output, "winws.exe"));
+        assert!(!tasklist_output_has_process(
+            output,
+            "TgWsProxy_windows.exe"
+        ));
+    }
+
+    #[test]
+    fn telegram_proxy_appdata_config_disables_proxy_update_checks() {
+        let existing = TelegramProxyAppDataConfig {
+            port: 1080,
+            host: "127.0.0.1".to_owned(),
+            dc_ip: vec!["2:149.154.167.220".to_owned()],
+            verbose: true,
+            autostart: true,
+            log_max_mb: 12,
+            buf_kb: 512,
+            pool_size: 8,
+            check_updates: true,
+            cfproxy: false,
+            cfproxy_priority: false,
+            cfproxy_domain: String::new(),
+            secret: "custom-secret".to_owned(),
+        };
+
+        let standard = telegram_proxy_appdata_config(
+            &TelegramProxyLaunchConfig {
+                enabled: true,
+                mode: TelegramProxyMode::Standard,
+                cf_domain: String::new(),
+            },
+            Some(&existing),
+        );
+        let cf_media = telegram_proxy_appdata_config(
+            &TelegramProxyLaunchConfig {
+                enabled: true,
+                mode: TelegramProxyMode::CfMedia,
+                cf_domain: "example.test".to_owned(),
+            },
+            Some(&existing),
+        );
+
+        assert!(!standard.check_updates);
+        assert!(!cf_media.check_updates);
+        assert_eq!(standard.secret, "custom-secret");
+        assert_eq!(cf_media.secret, "custom-secret");
     }
 
     #[test]

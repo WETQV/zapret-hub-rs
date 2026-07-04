@@ -42,49 +42,27 @@ pub(crate) enum ZapretProfile {
 }
 
 impl ZapretProfile {
-    pub(crate) const ALL: [Self; 19] = [
-        Self::Alt,
-        Self::Alt2,
-        Self::Alt3,
-        Self::Alt4,
-        Self::Alt5,
-        Self::Alt6,
-        Self::Alt7,
-        Self::Alt8,
-        Self::Alt9,
-        Self::Alt10,
-        Self::Alt11,
-        Self::FakeTlsAutoAlt,
-        Self::FakeTlsAutoAlt2,
-        Self::FakeTlsAutoAlt3,
-        Self::FakeTlsAuto,
-        Self::SimpleFakeAlt,
-        Self::SimpleFakeAlt2,
-        Self::SimpleFake,
-        Self::General,
-    ];
-
-    pub(crate) fn label(self) -> &'static str {
+    pub(crate) fn script_name(self) -> &'static str {
         match self {
-            Self::General => "general",
-            Self::Alt => "ALT",
-            Self::Alt2 => "ALT2",
-            Self::Alt3 => "ALT3",
-            Self::Alt4 => "ALT4",
-            Self::Alt5 => "ALT5",
-            Self::Alt6 => "ALT6",
-            Self::Alt7 => "ALT7",
-            Self::Alt8 => "ALT8",
-            Self::Alt9 => "ALT9",
-            Self::Alt10 => "ALT10",
-            Self::Alt11 => "ALT11",
-            Self::FakeTlsAuto => "FAKE TLS AUTO",
-            Self::FakeTlsAutoAlt => "FAKE TLS AUTO ALT",
-            Self::FakeTlsAutoAlt2 => "FAKE TLS AUTO ALT2",
-            Self::FakeTlsAutoAlt3 => "FAKE TLS AUTO ALT3",
-            Self::SimpleFake => "SIMPLE FAKE",
-            Self::SimpleFakeAlt => "SIMPLE FAKE ALT",
-            Self::SimpleFakeAlt2 => "SIMPLE FAKE ALT2",
+            Self::General => "general.bat",
+            Self::Alt => "general (ALT).bat",
+            Self::Alt2 => "general (ALT2).bat",
+            Self::Alt3 => "general (ALT3).bat",
+            Self::Alt4 => "general (ALT4).bat",
+            Self::Alt5 => "general (ALT5).bat",
+            Self::Alt6 => "general (ALT6).bat",
+            Self::Alt7 => "general (ALT7).bat",
+            Self::Alt8 => "general (ALT8).bat",
+            Self::Alt9 => "general (ALT9).bat",
+            Self::Alt10 => "general (ALT10).bat",
+            Self::Alt11 => "general (ALT11).bat",
+            Self::FakeTlsAuto => "general (FAKE TLS AUTO).bat",
+            Self::FakeTlsAutoAlt => "general (FAKE TLS AUTO ALT).bat",
+            Self::FakeTlsAutoAlt2 => "general (FAKE TLS AUTO ALT2).bat",
+            Self::FakeTlsAutoAlt3 => "general (FAKE TLS AUTO ALT3).bat",
+            Self::SimpleFake => "general (SIMPLE FAKE).bat",
+            Self::SimpleFakeAlt => "general (SIMPLE FAKE ALT).bat",
+            Self::SimpleFakeAlt2 => "general (SIMPLE FAKE ALT2).bat",
         }
     }
 }
@@ -109,6 +87,8 @@ pub(crate) struct AppConfig {
     pub(crate) dismissed_bundle_release_tag: Option<String>,
     #[serde(default)]
     pub(crate) main_profile: ZapretProfile,
+    #[serde(default)]
+    pub(crate) main_profile_script: Option<String>,
     #[serde(default = "default_startup_notifications_enabled")]
     pub(crate) startup_notifications_enabled: bool,
     #[serde(default)]
@@ -127,9 +107,18 @@ impl Default for AppConfig {
             selected_tab: default_selected_tab(),
             dismissed_bundle_release_tag: None,
             main_profile: ZapretProfile::default(),
+            main_profile_script: Some(ZapretProfile::default().script_name().to_owned()),
             startup_notifications_enabled: default_startup_notifications_enabled(),
             last_seen_app_version: None,
         }
+    }
+}
+
+impl AppConfig {
+    pub(crate) fn main_profile_script_or_legacy(&self) -> &str {
+        self.main_profile_script
+            .as_deref()
+            .unwrap_or_else(|| self.main_profile.script_name())
     }
 }
 
@@ -188,4 +177,24 @@ fn config_dir() -> Result<PathBuf> {
         .context("current executable has no parent directory")?;
 
     Ok(exe_dir.join("config"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn main_profile_script_falls_back_to_legacy_enum() {
+        let config: AppConfig = serde_json::from_str(
+            r#"{
+  "main_profile": "alt11"
+}"#,
+        )
+        .expect("legacy config parses");
+
+        assert_eq!(
+            config.main_profile_script_or_legacy(),
+            "general (ALT11).bat"
+        );
+    }
 }

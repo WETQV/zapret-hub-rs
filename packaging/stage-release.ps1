@@ -1,5 +1,5 @@
 param(
-    [string]$BundlePath = "C:\Users\mejik\Downloads\zapret-discord-youtube-1.9.8c",
+    [string]$BundlePath,
     [string]$StageRoot = "dist\stage"
 )
 
@@ -9,10 +9,6 @@ $env:LANG = "en_US.UTF-8"
 $env:LC_ALL = "en_US.UTF-8"
 $env:PYTHONIOENCODING = "utf-8"
 
-if (-not (Test-Path $BundlePath)) {
-    throw "Bundle path not found: $BundlePath"
-}
-
 $projectRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $stagePath = Join-Path $projectRoot $StageRoot
 $bundleTarget = Join-Path $stagePath "bundle"
@@ -20,10 +16,12 @@ $exeSource = Join-Path $projectRoot "target\release\zapret-hub-rs.exe"
 $exeTarget = Join-Path $stagePath "Zapret Hub.exe"
 $whitelistSource = Join-Path $projectRoot "assets\builtin-whitelist.txt"
 $whitelistTarget = Join-Path $stagePath "builtin-whitelist.txt"
+$bundleReleaseApi = "https://api.github.com/repos/Flowseal/zapret-discord-youtube/releases/latest"
 $tgProxyReleaseApi = "https://api.github.com/repos/Flowseal/tg-ws-proxy/releases/latest"
 $tgProxyAssetName = "TgWsProxy_windows.exe"
 $tgProxyVersionFileName = "TgWsProxy_windows.version.json"
 $bundleVersionFileName = "ZapretBundle.version.json"
+$upstreamUpdateCheckFlagRelativePath = "utils\check_updates.enabled"
 $githubHostlistEntries = @(
     "github.com",
     "www.github.com",
@@ -80,6 +78,79 @@ function Update-TextFile {
     }
 
     [System.IO.File]::WriteAllText($Path, $content, [System.Text.Encoding]::UTF8)
+}
+
+function Test-BundleRoot {
+    param([string]$Path)
+
+    return (Test-Path (Join-Path $Path "bin")) `
+        -and (Test-Path (Join-Path $Path "lists")) `
+        -and (Test-Path (Join-Path $Path "service.bat")) `
+        -and (Test-Path (Join-Path $Path "general (SIMPLE FAKE ALT2).bat"))
+}
+
+function Find-BundleRoot {
+    param([string]$ExtractRoot)
+
+    if (Test-BundleRoot -Path $ExtractRoot) {
+        return $ExtractRoot
+    }
+
+    $child = Get-ChildItem -LiteralPath $ExtractRoot -Directory |
+        Where-Object { Test-BundleRoot -Path $_.FullName } |
+        Select-Object -First 1
+
+    if (-not $child) {
+        throw "Downloaded archive does not contain a valid zapret bundle"
+    }
+
+    return $child.FullName
+}
+
+function Resolve-BundleSource {
+    param([string]$RequestedBundlePath)
+
+    if (-not [string]::IsNullOrWhiteSpace($RequestedBundlePath)) {
+        if (-not (Test-Path $RequestedBundlePath)) {
+            throw "Bundle path not found: $RequestedBundlePath"
+        }
+
+        return @{
+            Path = (Resolve-Path $RequestedBundlePath).Path
+            CleanupRoot = $null
+            Version = $null
+            SourceFolder = $null
+        }
+    }
+
+    $headers = @{
+        "User-Agent" = "zapret-hub-rs-packaging"
+        "Accept" = "application/vnd.github+json"
+    }
+
+    $release = Invoke-RestMethod -Headers $headers -Uri $bundleReleaseApi
+    $assetName = "zapret-discord-youtube-$($release.tag_name).zip"
+    $asset = $release.assets | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
+    if (-not $asset) {
+        throw "Latest bundle zip asset not found in GitHub release metadata: $assetName"
+    }
+
+    $downloadRoot = Join-Path ([System.IO.Path]::GetTempPath()) "zapret-hub-bundle-$([guid]::NewGuid())"
+    $zipPath = Join-Path $downloadRoot $asset.name
+    $extractRoot = Join-Path $downloadRoot "extract"
+    New-Item -ItemType Directory -Force -Path $downloadRoot | Out-Null
+
+    Invoke-WebRequest -Headers $headers -Uri $asset.browser_download_url -OutFile $zipPath
+    Expand-Archive -LiteralPath $zipPath -DestinationPath $extractRoot -Force
+
+    $bundleRoot = Find-BundleRoot -ExtractRoot $extractRoot
+
+    return @{
+        Path = $bundleRoot
+        CleanupRoot = $downloadRoot
+        Version = $release.tag_name
+        SourceFolder = [System.IO.Path]::GetFileNameWithoutExtension($asset.name)
+    }
 }
 
 function Write-Utf8Script {
@@ -187,50 +258,144 @@ start "" "%ROOT%\service.bat"
 
     Write-Utf8Script -Path (Join-Path $hubDir "remove_service.cmd") -Content @"
 @echo off
+setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 > nul
 cd /d "%~dp0"
 
-sc query zapret > nul 2>&1
-if not errorlevel 1 (
-    net stop zapret > nul 2>&1
-    sc delete zapret > nul 2>&1
+set "FAILED="
+
+call :stop_service zapret
+call :kill_process winws.exe
+call :kill_process TgWsProxy_windows.exe
+call :stop_service WinDivert
+call :stop_service WinDivert14
+call :verify_service_stopped zapret
+call :verify_process_stopped winws.exe
+call :verify_process_stopped TgWsProxy_windows.exe
+call :verify_service_stopped WinDivert
+call :verify_service_stopped WinDivert14
+
+if defined FAILED (
+    echo Failed to stop: !FAILED!
+    exit /b 1
 )
 
-tasklist /FI "IMAGENAME eq winws.exe" | find /I "winws.exe" > nul
-if not errorlevel 1 (
-    taskkill /IM winws.exe /F > nul 2>&1
-)
-
-sc stop WinDivert > nul 2>&1
-sc stop WinDivert14 > nul 2>&1
+sc delete zapret > nul 2>&1
+sc delete WinDivert > nul 2>&1
+sc delete WinDivert14 > nul 2>&1
 
 echo Service removal command completed.
+exit /b 0
+
+:stop_service
+sc query "%~1" > nul 2>&1
+if errorlevel 1 exit /b 0
+net stop "%~1" > nul 2>&1
+for /l %%I in (1,1,10) do (
+    sc query "%~1" 2>nul | findstr /I "RUNNING STOP_PENDING" > nul
+    if errorlevel 1 exit /b 0
+    timeout /t 1 /nobreak > nul
+)
+sc stop "%~1" > nul 2>&1
+exit /b 0
+
+:kill_process
+for /l %%I in (1,1,3) do (
+    tasklist /FI "IMAGENAME eq %~1" | find /I "%~1" > nul
+    if errorlevel 1 exit /b 0
+    taskkill /IM "%~1" /T /F > nul 2>&1
+    timeout /t 1 /nobreak > nul
+)
+exit /b 0
+
+:verify_service_stopped
+sc query "%~1" > nul 2>&1
+if errorlevel 1 exit /b 0
+sc query "%~1" 2>nul | findstr /I "RUNNING STOP_PENDING" > nul
+if not errorlevel 1 call :append_failure "service %~1"
+exit /b 0
+
+:verify_process_stopped
+tasklist /FI "IMAGENAME eq %~1" | find /I "%~1" > nul
+if not errorlevel 1 call :append_failure "process %~1"
+exit /b 0
+
+:append_failure
+if defined FAILED (
+    set "FAILED=!FAILED!; %~1"
+) else (
+    set "FAILED=%~1"
+)
+exit /b 0
 "@
 
     Write-Utf8Script -Path (Join-Path $hubDir "stop_all.cmd") -Content @"
 @echo off
+setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 > nul
 cd /d "%~dp0"
 
-sc query zapret > nul 2>&1
-if not errorlevel 1 (
-    net stop zapret > nul 2>&1
-)
+set "FAILED="
 
-tasklist /FI "IMAGENAME eq winws.exe" | find /I "winws.exe" > nul
-if not errorlevel 1 (
-    taskkill /IM winws.exe /F > nul 2>&1
-)
+call :stop_service zapret
+call :kill_process winws.exe
+call :kill_process TgWsProxy_windows.exe
+call :stop_service WinDivert
+call :stop_service WinDivert14
+call :verify_service_stopped zapret
+call :verify_process_stopped winws.exe
+call :verify_process_stopped TgWsProxy_windows.exe
+call :verify_service_stopped WinDivert
+call :verify_service_stopped WinDivert14
 
-tasklist /FI "IMAGENAME eq TgWsProxy_windows.exe" | find /I "TgWsProxy_windows.exe" > nul
-if not errorlevel 1 (
-    taskkill /IM TgWsProxy_windows.exe /F > nul 2>&1
+if defined FAILED (
+    echo Failed to stop: !FAILED!
+    exit /b 1
 )
-
-sc stop WinDivert > nul 2>&1
-sc stop WinDivert14 > nul 2>&1
 
 echo Bypass processes were stopped.
+exit /b 0
+
+:stop_service
+sc query "%~1" > nul 2>&1
+if errorlevel 1 exit /b 0
+net stop "%~1" > nul 2>&1
+for /l %%I in (1,1,10) do (
+    sc query "%~1" 2>nul | findstr /I "RUNNING STOP_PENDING" > nul
+    if errorlevel 1 exit /b 0
+    timeout /t 1 /nobreak > nul
+)
+sc stop "%~1" > nul 2>&1
+exit /b 0
+
+:kill_process
+for /l %%I in (1,1,3) do (
+    tasklist /FI "IMAGENAME eq %~1" | find /I "%~1" > nul
+    if errorlevel 1 exit /b 0
+    taskkill /IM "%~1" /T /F > nul 2>&1
+    timeout /t 1 /nobreak > nul
+)
+exit /b 0
+
+:verify_service_stopped
+sc query "%~1" > nul 2>&1
+if errorlevel 1 exit /b 0
+sc query "%~1" 2>nul | findstr /I "RUNNING STOP_PENDING" > nul
+if not errorlevel 1 call :append_failure "service %~1"
+exit /b 0
+
+:verify_process_stopped
+tasklist /FI "IMAGENAME eq %~1" | find /I "%~1" > nul
+if not errorlevel 1 call :append_failure "process %~1"
+exit /b 0
+
+:append_failure
+if defined FAILED (
+    set "FAILED=!FAILED!; %~1"
+) else (
+    set "FAILED=%~1"
+)
+exit /b 0
 "@
 }
 
@@ -271,21 +436,68 @@ function Add-StagedHostlistEntries {
     [System.IO.File]::WriteAllLines($listPath, $lines, $utf8NoBom)
 }
 
+function Remove-Sha256SumEntry {
+    param(
+        [string]$BundleRoot,
+        [string]$RelativePath
+    )
+
+    $checksumsPath = Join-Path $BundleRoot "SHA256SUMS.txt"
+    if (-not (Test-Path -LiteralPath $checksumsPath)) {
+        return
+    }
+
+    $normalizedRelativePath = $RelativePath.Replace("\", "/")
+    $lines = [System.IO.File]::ReadAllLines($checksumsPath, [System.Text.Encoding]::UTF8)
+    $filtered = New-Object System.Collections.Generic.List[string]
+    $changed = $false
+
+    foreach ($line in $lines) {
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            $filtered.Add($line)
+            continue
+        }
+
+        $parts = $line -split '\s+'
+        $target = $parts[$parts.Length - 1].Replace("\", "/")
+        if ($target.StartsWith("./")) {
+            $target = $target.Substring(2)
+        }
+
+        if ($target -eq $normalizedRelativePath) {
+            $changed = $true
+            continue
+        }
+
+        $filtered.Add($line)
+    }
+
+    if ($changed) {
+        [System.IO.File]::WriteAllLines($checksumsPath, $filtered, $utf8NoBom)
+    }
+}
+
+function Disable-UpstreamUpdateChecks {
+    param([string]$BundleRoot)
+
+    $flagPath = Join-Path $BundleRoot $upstreamUpdateCheckFlagRelativePath
+    if (Test-Path -LiteralPath $flagPath) {
+        Remove-Item -LiteralPath $flagPath -Force
+    }
+
+    Remove-Sha256SumEntry -BundleRoot $BundleRoot -RelativePath $upstreamUpdateCheckFlagRelativePath
+}
+
 function Patch-StagedBundle {
     param([string]$BundleRoot)
 
     Ensure-HubScripts -BundleRoot $BundleRoot
     Add-StagedHostlistEntries -BundleRoot $BundleRoot -Entries $githubHostlistEntries
+    Disable-UpstreamUpdateChecks -BundleRoot $BundleRoot
 
-    $profileScripts = @(
-        "general (SIMPLE FAKE ALT2).bat",
-        "general (ALT11).bat",
-        "general (FAKE TLS AUTO ALT3).bat",
-        "general (ALT7).bat"
-    )
-
-    foreach ($scriptName in $profileScripts) {
-        $scriptPath = Join-Path $BundleRoot $scriptName
+    $profileScripts = Get-ChildItem -LiteralPath $BundleRoot -File -Filter "general*.bat"
+    foreach ($script in $profileScripts) {
+        $scriptPath = $script.FullName
         Update-TextFile -Path $scriptPath -Replacements @{
             'start "zapret: %~n0" /min "%BIN%winws.exe"' = 'start "" /B "%BIN%winws.exe"'
         }
@@ -338,18 +550,25 @@ function Update-StagedTelegramProxy {
 function Write-BundleVersionMetadata {
     param(
         [string]$BundleRoot,
-        [string]$BundleSourcePath
+        [string]$BundleSourcePath,
+        [string]$Version,
+        [string]$SourceFolder
     )
 
-    $bundleFolderName = Split-Path $BundleSourcePath -Leaf
-    $version = $bundleFolderName
-    if ($version -like "zapret-discord-youtube-*") {
-        $version = $version.Substring("zapret-discord-youtube-".Length)
+    if ([string]::IsNullOrWhiteSpace($SourceFolder)) {
+        $SourceFolder = Split-Path $BundleSourcePath -Leaf
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Version)) {
+        $Version = $SourceFolder
+        if ($Version -like "zapret-discord-youtube-*") {
+            $Version = $Version.Substring("zapret-discord-youtube-".Length)
+        }
     }
 
     $bundleInfo = @{
-        version = $version
-        source_folder = $bundleFolderName
+        version = $Version
+        source_folder = $SourceFolder
     } | ConvertTo-Json -Depth 3
 
     [System.IO.File]::WriteAllText(
@@ -359,29 +578,42 @@ function Write-BundleVersionMetadata {
     )
 }
 
-if (Test-Path $stagePath) {
-    Remove-Item -Recurse -Force $stagePath
-}
+$resolvedBundle = Resolve-BundleSource -RequestedBundlePath $BundlePath
 
-New-Item -ItemType Directory -Force -Path $bundleTarget | Out-Null
-
-Push-Location $projectRoot
 try {
-    cargo build --release
+    if (Test-Path $stagePath) {
+        Remove-Item -Recurse -Force $stagePath
+    }
+
+    New-Item -ItemType Directory -Force -Path $bundleTarget | Out-Null
+
+    Push-Location $projectRoot
+    try {
+        cargo build --release
+    }
+    finally {
+        Pop-Location
+    }
+
+    if (-not (Test-Path $exeSource)) {
+        throw "Release executable not found: $exeSource"
+    }
+
+    Copy-Item $exeSource $exeTarget -Force
+    Copy-Item $whitelistSource $whitelistTarget -Force
+    Copy-Item (Join-Path $resolvedBundle.Path "*") $bundleTarget -Recurse -Force
+    Write-BundleVersionMetadata `
+        -BundleRoot $bundleTarget `
+        -BundleSourcePath $resolvedBundle.Path `
+        -Version $resolvedBundle.Version `
+        -SourceFolder $resolvedBundle.SourceFolder
+    Update-StagedTelegramProxy -BundleRoot $bundleTarget
+    Patch-StagedBundle -BundleRoot $bundleTarget
 }
 finally {
-    Pop-Location
+    if ($resolvedBundle.CleanupRoot -and (Test-Path $resolvedBundle.CleanupRoot)) {
+        Remove-Item -Recurse -Force $resolvedBundle.CleanupRoot
+    }
 }
-
-if (-not (Test-Path $exeSource)) {
-    throw "Release executable not found: $exeSource"
-}
-
-Copy-Item $exeSource $exeTarget -Force
-Copy-Item $whitelistSource $whitelistTarget -Force
-Copy-Item (Join-Path $BundlePath "*") $bundleTarget -Recurse -Force
-Write-BundleVersionMetadata -BundleRoot $bundleTarget -BundleSourcePath $BundlePath
-Update-StagedTelegramProxy -BundleRoot $bundleTarget
-Patch-StagedBundle -BundleRoot $bundleTarget
 
 Write-Host "Staged application at: $stagePath"

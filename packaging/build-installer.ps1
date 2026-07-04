@@ -1,5 +1,5 @@
 param(
-    [string]$BundlePath = "C:\Users\mejik\Downloads\zapret-discord-youtube-1.9.8c"
+    [string]$BundlePath
 )
 
 $ErrorActionPreference = "Stop"
@@ -10,10 +10,28 @@ $env:PYTHONIOENCODING = "utf-8"
 
 $projectRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $cargoToml = Join-Path $projectRoot "Cargo.toml"
-$isccPath = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
 $installerScript = Join-Path $projectRoot "installer\zapret-hub.iss"
 $stageScript = Join-Path $projectRoot "packaging\stage-release.ps1"
 $manifestScript = Join-Path $projectRoot "packaging\generate-update-manifest.ps1"
+
+function Resolve-InnoSetupCompiler {
+    $candidates = @(
+        (Join-Path $env:ProgramFiles "Inno Setup 7\ISCC.exe"),
+        (Join-Path ${env:ProgramFiles(x86)} "Inno Setup 7\ISCC.exe"),
+        (Join-Path $env:ProgramFiles "Inno Setup 6\ISCC.exe"),
+        (Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe")
+    )
+
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate) {
+            return $candidate
+        }
+    }
+
+    throw "Inno Setup compiler not found. Checked: $($candidates -join '; ')"
+}
+
+$isccPath = Resolve-InnoSetupCompiler
 
 if (-not (Test-Path $isccPath)) {
     throw "Inno Setup compiler not found: $isccPath"
@@ -26,7 +44,12 @@ if (-not $versionLine) {
 
 $version = $versionLine.Matches[0].Groups[1].Value
 
-& $stageScript -BundlePath $BundlePath
+$stageArgs = @{}
+if ($PSBoundParameters.ContainsKey("BundlePath")) {
+    $stageArgs.BundlePath = $BundlePath
+}
+
+& $stageScript @stageArgs
 
 New-Item -ItemType Directory -Force -Path (Join-Path $projectRoot "dist\installer") | Out-Null
 
@@ -34,6 +57,9 @@ New-Item -ItemType Directory -Force -Path (Join-Path $projectRoot "dist\installe
     "/DAppVersion=$version" `
     "/DSourceDir=$projectRoot\dist\stage" `
     $installerScript
+if ($LASTEXITCODE -ne 0) {
+    throw "Inno Setup compiler failed with exit code $LASTEXITCODE"
+}
 
 $installerFile = "zapret-hub-setup-$version.exe"
 
