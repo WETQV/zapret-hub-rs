@@ -1,7 +1,9 @@
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use eframe::egui;
 use eframe::egui::{Align, Color32, CornerRadius, RichText, Stroke, Vec2};
@@ -10,9 +12,6 @@ use crate::LaunchMode;
 use crate::core::autostart;
 use crate::core::build_info::{APP_AUTHOR, APP_NAME, APP_VERSION, BUILD_DATE, BUILT_BY};
 use crate::core::bundle_metadata::detect_bundle_version;
-use crate::core::bundle_test::{
-    BundleTestSummary, bundle_test_script_path, read_latest_bundle_test_result, start_bundle_test,
-};
 use crate::core::bundle_update::{
     BundleRelease, BundleUpdateOutcome, BundleUpdateStatus, PreparedBundleUpdate,
     apply_prepared_update as apply_bundle_update, check_for_update as check_bundle_update,
@@ -20,6 +19,10 @@ use crate::core::bundle_update::{
 };
 use crate::core::config::{AppConfig, TelegramProxyMode, load_app_config, save_app_config};
 use crate::core::paths::{ResolvedPaths, is_valid_bundle_dir, resolve_paths};
+use crate::core::profile_test::{
+    ProfileTestEvent, ProfileTestMode, ProfileTestReport, ProfileTestRequest,
+    preflight as profile_test_preflight, start as start_profile_test,
+};
 use crate::core::status::{RuntimeStatus, ServiceState, refresh_runtime_status};
 use crate::core::tg_proxy_update::{
     TelegramProxyRelease, TelegramProxyUpdateStatus, check_for_update as check_tg_proxy_update,
@@ -29,6 +32,7 @@ use crate::zapret::bundle::{
     BundleAction, BundleProfile, TelegramProxyLaunchConfig, discover_profiles,
     find_profile_by_script, run_action,
 };
+use crate::zapret::fakes::{FakeCatalog, FakeTarget, apply_selection, read_catalog};
 
 pub(crate) struct ZapretHubApp {
     bundle_path: PathBuf,
@@ -45,6 +49,10 @@ pub(crate) struct ZapretHubApp {
     prepared_bundle_update: Option<PreparedBundleUpdate>,
     bundle_check_error: Option<String>,
     bundle_test: BundleTestState,
+    fake_catalog: Option<FakeCatalog>,
+    fake_catalog_error: Option<String>,
+    fake_discord_selection: Option<String>,
+    fake_game_selection: Option<String>,
     tg_proxy_task: Option<PendingTelegramProxyTask>,
     tg_proxy_status: Option<TelegramProxyUpdateStatus>,
     tg_proxy_check_error: Option<String>,
@@ -119,11 +127,34 @@ enum TelegramProxyTaskResult {
     Installed(String),
 }
 
-#[derive(Default)]
 struct BundleTestState {
-    launched_after: Option<SystemTime>,
-    summary: Option<BundleTestSummary>,
+    mode: ProfileTestMode,
+    advanced: bool,
+    selected_scripts: Vec<String>,
+    receiver: Option<Receiver<ProfileTestEvent>>,
+    cancellation: Option<Arc<AtomicBool>>,
+    current: usize,
+    total: usize,
+    current_label: Option<String>,
+    report: Option<ProfileTestReport>,
     error: Option<String>,
+}
+
+impl Default for BundleTestState {
+    fn default() -> Self {
+        Self {
+            mode: ProfileTestMode::Standard,
+            advanced: false,
+            selected_scripts: Vec::new(),
+            receiver: None,
+            cancellation: None,
+            current: 0,
+            total: 0,
+            current_label: None,
+            report: None,
+            error: None,
+        }
+    }
 }
 
 struct StatusMonitor {
@@ -275,6 +306,16 @@ impl ZapretHubApp {
                 Vec::new()
             }
         };
+        let (fake_catalog, fake_catalog_error) = match read_catalog(&bundle_dir) {
+            Ok(catalog) => (Some(catalog), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        let fake_discord_selection = fake_catalog
+            .as_ref()
+            .and_then(|catalog| catalog.discord_current.clone());
+        let fake_game_selection = fake_catalog
+            .as_ref()
+            .and_then(|catalog| catalog.game_current.clone());
         let profile_selection_changed =
             reconcile_main_profile_script(&mut app_config, profiles.as_slice());
         if profile_selection_changed && let Err(error) = save_app_config(&app_config) {
@@ -308,6 +349,10 @@ impl ZapretHubApp {
             prepared_bundle_update: None,
             bundle_check_error: None,
             bundle_test: BundleTestState::default(),
+            fake_catalog,
+            fake_catalog_error,
+            fake_discord_selection,
+            fake_game_selection,
             tg_proxy_task: None,
             tg_proxy_status: None,
             tg_proxy_check_error: None,
@@ -468,49 +513,102 @@ impl ZapretHubApp {
             self.last_message = blocker;
             return;
         }
-
-        let launched_after = SystemTime::now();
-        match start_bundle_test(&self.bundle_path, launched_after) {
-            Ok(()) => {
-                self.bundle_test.launched_after = Some(launched_after);
-                self.bundle_test.summary = None;
-                self.bundle_test.error = None;
-                self.last_message =
-                    "Тест профилей запущен. Завершите сценарий в окне PowerShell.".to_owned();
-            }
-            Err(error) => {
-                self.bundle_test.error = Some(error.to_string());
-                self.last_message = format!("Не удалось запустить тест профилей: {error}");
-            }
+        let profiles = if self.bundle_test.advanced {
+            self.profiles
+                .iter()
+                .filter(|profile| {
+                    self.bundle_test
+                        .selected_scripts
+                        .iter()
+                        .any(|script| script.eq_ignore_ascii_case(profile.script_name()))
+                })
+                .cloned()
+                .collect()
+        } else {
+            self.profiles.clone()
+        };
+        let request = ProfileTestRequest {
+            mode: self.bundle_test.mode,
+            profiles,
+        };
+        if let Err(error) = profile_test_preflight(&self.bundle_path, &request) {
+            self.bundle_test.error = Some(error.to_string());
+            self.last_message = format!("Тест не запущен: {error}");
+            return;
         }
+        let (sender, receiver) = mpsc::channel();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        start_profile_test(
+            self.bundle_path.clone(),
+            request,
+            cancellation.clone(),
+            sender,
+        );
+        self.bundle_test.receiver = Some(receiver);
+        self.bundle_test.cancellation = Some(cancellation);
+        self.bundle_test.current = 0;
+        self.bundle_test.total = 0;
+        self.bundle_test.current_label = None;
+        self.bundle_test.report = None;
+        self.bundle_test.error = None;
+        self.last_message = "Ищу лучший профиль. Окно PowerShell не откроется.".to_owned();
     }
 
     fn poll_bundle_test_result(&mut self) {
-        let Some(launched_after) = self.bundle_test.launched_after else {
-            return;
-        };
-
-        if self.bundle_test.summary.is_some() || self.bundle_test.error.is_some() {
-            return;
+        let mut completed = false;
+        if let Some(receiver) = &self.bundle_test.receiver {
+            while let Ok(event) = receiver.try_recv() {
+                match event {
+                    ProfileTestEvent::Started { total } => self.bundle_test.total = total,
+                    ProfileTestEvent::ProfileStarted {
+                        current,
+                        total,
+                        label,
+                    } => {
+                        self.bundle_test.current = current;
+                        self.bundle_test.total = total;
+                        self.bundle_test.current_label = Some(label);
+                    }
+                    ProfileTestEvent::CheckStarted { label } => {
+                        self.bundle_test.current_label = Some(format!("Проверка: {label}"));
+                    }
+                    ProfileTestEvent::ProfileFinished(row) => {
+                        self.bundle_test.current_label =
+                            Some(format!("{}: проверки завершены", row.label));
+                    }
+                    ProfileTestEvent::Finished(report) => {
+                        let best = report
+                            .best_script
+                            .clone()
+                            .unwrap_or_else(|| "не определён".to_owned());
+                        self.bundle_test.report = Some(report);
+                        self.last_message = format!("Тест завершён. Лучший профиль: {best}.");
+                        completed = true;
+                    }
+                    ProfileTestEvent::Cancelled => {
+                        self.last_message =
+                            "Тест отменён, исходное состояние восстановлено.".to_owned();
+                        completed = true;
+                    }
+                    ProfileTestEvent::Failed(error) => {
+                        self.bundle_test.error = Some(error.clone());
+                        self.last_message = format!("Тест завершился с ошибкой: {error}");
+                        completed = true;
+                    }
+                }
+            }
         }
+        if completed {
+            self.bundle_test.receiver = None;
+            self.bundle_test.cancellation = None;
+            self.bundle_test.current_label = None;
+        }
+    }
 
-        match read_latest_bundle_test_result(&self.bundle_path, launched_after) {
-            Ok(Some(summary)) => {
-                let best = summary
-                    .best_strategy
-                    .as_deref()
-                    .unwrap_or("не определён")
-                    .to_owned();
-                self.bundle_test.summary = Some(summary);
-                self.bundle_test.launched_after = None;
-                self.last_message = format!("Тест профилей завершён. Лучший профиль: {best}.");
-            }
-            Ok(None) => {}
-            Err(error) => {
-                self.bundle_test.error = Some(error.to_string());
-                self.bundle_test.launched_after = None;
-                self.last_message = format!("Не удалось прочитать результат теста: {error}");
-            }
+    fn cancel_bundle_test(&mut self) {
+        if let Some(cancellation) = &self.bundle_test.cancellation {
+            cancellation.store(true, Ordering::Relaxed);
+            self.last_message = "Отменяю тест и восстанавливаю исходное состояние.".to_owned();
         }
     }
 
@@ -805,6 +903,10 @@ impl ZapretHubApp {
 
                     match result {
                         Ok(message) => {
+                            let stopped_runtime = matches!(
+                                action,
+                                BundleAction::StopAll | BundleAction::RemoveService
+                            );
                             self.last_profile = match action {
                                 BundleAction::StartProfile { ref profile, .. } => {
                                     Some(profile.label().to_owned())
@@ -813,6 +915,9 @@ impl ZapretHubApp {
                                 _ => self.last_profile.clone(),
                             };
                             self.last_message = self.describe_action_result(action, message);
+                            if stopped_runtime {
+                                self.status = refresh_runtime_status(&self.bundle_path);
+                            }
                             self.status_monitor.request_refresh();
                         }
                         Err(error) => {
@@ -924,6 +1029,7 @@ impl ZapretHubApp {
                             self.prepared_bundle_update = None;
                             self.bundle_version = detect_bundle_version(&self.bundle_path);
                             self.refresh_profiles();
+                            self.refresh_fake_catalog();
                             self.app_config.dismissed_bundle_release_tag = None;
                             let _ = save_app_config(&self.app_config);
                             self.start_bundle_update_check();
@@ -988,9 +1094,7 @@ impl ZapretHubApp {
     }
 
     fn bundle_test_waiting(&self) -> bool {
-        self.bundle_test.launched_after.is_some()
-            && self.bundle_test.summary.is_none()
-            && self.bundle_test.error.is_none()
+        self.bundle_test.receiver.is_some()
     }
 
     fn profile_actions_enabled(&self) -> bool {
@@ -1088,8 +1192,11 @@ impl ZapretHubApp {
         if self.runtime_is_active() {
             return Some("Остановите текущий профиль или сервис перед тестом bundle.".to_owned());
         }
-        if !bundle_test_script_path(&self.bundle_path).is_file() {
-            return Some("В текущем bundle нет utils\\test zapret.ps1.".to_owned());
+        if !matches!(self.status.service_state, ServiceState::NotInstalled) {
+            return Some("Удалите службу zapret перед тестом профилей.".to_owned());
+        }
+        if !self.bundle_path.join("bin").join("winws.exe").is_file() {
+            return Some("В текущем bundle нет bin\\winws.exe.".to_owned());
         }
 
         None
@@ -1528,21 +1635,11 @@ impl ZapretHubApp {
     fn draw_bundle_tests(&mut self, ui: &mut egui::Ui) {
         Self::card(
             ui,
-            "Тест профилей",
-            "Запускает upstream тест из bundle и показывает лучший найденный профиль.",
+            "Поиск лучшего профиля",
+            "Проверяет профили скрыто и показывает понятный результат прямо в приложении.",
             |ui| {
                 let blocker = self.bundle_test_blocker();
-                let waiting = self.bundle_test.launched_after.is_some()
-                    && self.bundle_test.summary.is_none()
-                    && self.bundle_test.error.is_none();
-
-                Self::status_row(
-                    ui,
-                    "Скрипт",
-                    bundle_test_script_path(&self.bundle_path)
-                        .display()
-                        .to_string(),
-                );
+                let waiting = self.bundle_test_waiting();
 
                 if let Some(blocker) = &blocker {
                     ui.add_space(8.0);
@@ -1550,25 +1647,118 @@ impl ZapretHubApp {
                 }
 
                 ui.add_space(10.0);
-                if ui
-                    .add_enabled(
-                        blocker.is_none() && !waiting,
-                        egui::Button::new("Запустить тест профилей"),
-                    )
-                    .on_hover_text(
-                        "Откроет PowerShell с utils\\test zapret.ps1 из текущего bundle.",
+                if !waiting {
+                    if Self::primary_button(
+                        ui,
+                        "Найти лучший профиль",
+                        "Проверит все профили обычным HTTP, TLS и ping тестом без окна PowerShell.",
+                        blocker.is_none(),
                     )
                     .clicked()
-                {
-                    self.start_bundle_test_run();
+                    {
+                        self.bundle_test.advanced = false;
+                        self.bundle_test.mode = ProfileTestMode::Standard;
+                        self.start_bundle_test_run();
+                    }
+
+                    let advanced = ui.checkbox(
+                        &mut self.bundle_test.advanced,
+                        "Дополнительные настройки поиска",
+                    );
+                    if advanced.changed() && self.bundle_test.advanced {
+                        self.bundle_test.selected_scripts = self
+                            .profiles
+                            .iter()
+                            .map(|profile| profile.script_name().to_owned())
+                            .collect();
+                    }
+
+                    if self.bundle_test.advanced {
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Режим:");
+                            ui.selectable_value(
+                                &mut self.bundle_test.mode,
+                                ProfileTestMode::Standard,
+                                ProfileTestMode::Standard.label(),
+                            );
+                            ui.selectable_value(
+                                &mut self.bundle_test.mode,
+                                ProfileTestMode::Dpi,
+                                ProfileTestMode::Dpi.label(),
+                            );
+                        });
+                        if self.bundle_test.mode == ProfileTestMode::Dpi {
+                            ui.label(
+                                RichText::new(
+                                    "DPI-проверка занимает заметно больше времени и временно очищает ipset; он будет восстановлен после завершения или отмены.",
+                                )
+                                .color(Color32::from_rgb(198, 120, 0)),
+                            );
+                        }
+                        ui.horizontal(|ui| {
+                            if ui.button("Выбрать все").clicked() {
+                                self.bundle_test.selected_scripts = self
+                                    .profiles
+                                    .iter()
+                                    .map(|profile| profile.script_name().to_owned())
+                                    .collect();
+                            }
+                            if ui.button("Снять выбор").clicked() {
+                                self.bundle_test.selected_scripts.clear();
+                            }
+                        });
+                        for profile in self.profiles.clone() {
+                            let mut selected =
+                                self.bundle_test.selected_scripts.iter().any(|script| {
+                                    script.eq_ignore_ascii_case(profile.script_name())
+                                });
+                            if ui.checkbox(&mut selected, profile.label()).changed() {
+                                if selected {
+                                    self.bundle_test
+                                        .selected_scripts
+                                        .push(profile.script_name().to_owned());
+                                } else {
+                                    self.bundle_test.selected_scripts.retain(|script| {
+                                        !script.eq_ignore_ascii_case(profile.script_name())
+                                    });
+                                }
+                            }
+                        }
+                        if Self::primary_button(
+                            ui,
+                            "Запустить выбранные профили",
+                            "Проверит отмеченные профили с выбранным набором тестов.",
+                            blocker.is_none(),
+                        )
+                        .clicked()
+                        {
+                            self.start_bundle_test_run();
+                        }
+                    }
                 }
 
                 if waiting {
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label("Жду файл результата из utils\\test results.");
+                        let current = self.bundle_test.current;
+                        let total = self.bundle_test.total.max(1);
+                        ui.label(format!("Профиль {current} из {total}"));
+                        if let Some(label) = &self.bundle_test.current_label {
+                            ui.label(format!("— {label}"));
+                        }
+                        if ui.button("Отменить").clicked() {
+                            self.cancel_bundle_test();
+                        }
                     });
+                    let progress =
+                        self.bundle_test.current as f32 / self.bundle_test.total.max(1) as f32;
+                    ui.add(egui::ProgressBar::new(progress).show_percentage());
+                    ui.label(
+                        RichText::new("Проверяю HTTP, TLS и ping. Консольные окна не открываются.")
+                            .color(Color32::from_gray(120)),
+                    );
                 }
 
                 if let Some(error) = &self.bundle_test.error {
@@ -1576,14 +1766,14 @@ impl ZapretHubApp {
                     ui.label(RichText::new(error).color(Color32::from_rgb(198, 120, 0)));
                 }
 
-                if let Some(summary) = self.bundle_test.summary.clone() {
+                if let Some(report) = self.bundle_test.report.clone() {
                     ui.add_space(12.0);
-                    Self::status_row(ui, "Результат", summary.result_path.display().to_string());
-                    let best = summary.best_strategy.as_deref().unwrap_or("не определён");
+                    Self::status_row(ui, "Результат", report.result_path.display().to_string());
+                    let best = report.best_script.as_deref().unwrap_or("не определён");
                     Self::status_row(ui, "Лучший профиль", best);
 
-                    if let Some(best_strategy) = summary.best_strategy.as_deref() {
-                        match find_profile_by_script(&self.bundle_path, best_strategy) {
+                    if let Some(best_script) = report.best_script.as_deref() {
+                        match find_profile_by_script(&self.bundle_path, best_script) {
                             Ok(Some(profile)) => {
                                 if ui
                                     .add_enabled(
@@ -1612,22 +1802,164 @@ impl ZapretHubApp {
                     }
 
                     ui.add_space(10.0);
-                    for config in summary.configs.iter().take(6) {
-                        Self::status_row(
-                            ui,
-                            config.config.as_str(),
-                            format!("{}: {}", config.test_type, config.analytics),
-                        );
+                    egui::Grid::new("profile-test-results")
+                        .striped(true)
+                        .show(ui, |ui| {
+                            ui.strong("Профиль");
+                            ui.strong(if report.mode == ProfileTestMode::Dpi {
+                                "OK"
+                            } else {
+                                "HTTP/TLS"
+                            });
+                            ui.strong(if report.mode == ProfileTestMode::Dpi {
+                                "FAIL"
+                            } else {
+                                "Ошибки"
+                            });
+                            ui.strong(if report.mode == ProfileTestMode::Dpi {
+                                "BLOCKED"
+                            } else {
+                                "Ping"
+                            });
+                            ui.end_row();
+                            for row in &report.rows {
+                                let winner =
+                                    report.best_script.as_deref() == Some(row.script_name.as_str());
+                                ui.label(if winner {
+                                    RichText::new(&row.label).strong()
+                                } else {
+                                    RichText::new(&row.label)
+                                });
+                                ui.label(row.ok.to_string());
+                                ui.label(row.errors.to_string());
+                                ui.label(if report.mode == ProfileTestMode::Dpi {
+                                    row.blocked.to_string()
+                                } else {
+                                    format!("{}/{}", row.ping_ok, row.ping_failed)
+                                });
+                                ui.end_row();
+                            }
+                        });
+                }
+            },
+        );
+    }
+
+    fn refresh_fake_catalog(&mut self) {
+        match read_catalog(&self.bundle_path) {
+            Ok(catalog) => {
+                self.fake_discord_selection = catalog.discord_current.clone();
+                self.fake_game_selection = catalog.game_current.clone();
+                self.fake_catalog = Some(catalog);
+                self.fake_catalog_error = None;
+            }
+            Err(error) => {
+                self.fake_catalog = None;
+                self.fake_catalog_error = Some(error.to_string());
+            }
+        }
+    }
+
+    fn draw_fake_files(&mut self, ui: &mut egui::Ui) {
+        let enabled = self.pending_action.is_none()
+            && self.bundle_task.is_none()
+            && self.tg_proxy_task.is_none()
+            && !self.runtime_is_active()
+            && !self.bundle_test_waiting();
+        let mut apply = None;
+        Self::card(
+            ui,
+            "UDP fake-файлы",
+            "Выберите отдельные fake-файлы для Discord Voice и GameFilter. Применение доступно только при остановленном runtime.",
+            |ui| {
+                if let Some(error) = &self.fake_catalog_error {
+                    ui.label(RichText::new(error).color(Color32::from_rgb(198, 120, 0)));
+                    if ui.button("Обновить список").clicked() {
+                        self.refresh_fake_catalog();
                     }
-                    if summary.configs.len() > 6 {
+                    return;
+                }
+                let Some(catalog) = self.fake_catalog.clone() else {
+                    ui.label("Каталог fake-файлов пока недоступен.");
+                    return;
+                };
+                if catalog.entries.is_empty() {
+                    ui.label(
+                        RichText::new("В bin не найдены доступные .bin fake-файлы.")
+                            .color(Color32::from_rgb(198, 120, 0)),
+                    );
+                    return;
+                }
+                for target in FakeTarget::ALL {
+                    let (current, selection, id) = match target {
+                        FakeTarget::DiscordUdp => (
+                            catalog.discord_current.clone(),
+                            &mut self.fake_discord_selection,
+                            "discord-udp-fake",
+                        ),
+                        FakeTarget::GameFilterUdp => (
+                            catalog.game_current.clone(),
+                            &mut self.fake_game_selection,
+                            "game-filter-udp-fake",
+                        ),
+                    };
+                    if selection.is_none() {
+                        *selection = current.clone();
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label(target.label());
+                        egui::ComboBox::from_id_salt(id)
+                            .selected_text(
+                                selection
+                                    .as_deref()
+                                    .unwrap_or("Пользовательский или из старой версии"),
+                            )
+                            .show_ui(ui, |ui| {
+                                for entry in &catalog.entries {
+                                    ui.selectable_value(
+                                        selection,
+                                        Some(entry.file_name.clone()),
+                                        &entry.file_name,
+                                    );
+                                }
+                            });
+                        let changed = selection.as_deref() != current.as_deref();
+                        if ui
+                            .add_enabled(
+                                enabled && changed && selection.is_some(),
+                                egui::Button::new("Применить"),
+                            )
+                            .clicked()
+                        {
+                            apply = selection.clone().map(|file_name| (target, file_name));
+                        }
+                    });
+                    if current.is_none() {
                         ui.label(
-                            RichText::new("Остальные строки сохранены в файле результата.")
+                            RichText::new("Текущий ACTIVE-файл не совпадает с каталогом и не будет заменён сам.")
                                 .color(Color32::from_gray(120)),
                         );
                     }
                 }
+                if !enabled {
+                    ui.label(
+                        RichText::new("Сначала завершите runtime, поиск профиля или обновление.")
+                            .color(Color32::from_gray(120)),
+                    );
+                }
             },
         );
+        if let Some((target, file_name)) = apply {
+            match apply_selection(&self.bundle_path, target, &file_name) {
+                Ok(()) => {
+                    self.refresh_fake_catalog();
+                    self.last_message = format!("{} переключён на {file_name}.", target.label());
+                }
+                Err(error) => {
+                    self.last_message = format!("Не удалось применить fake-файл: {error}");
+                }
+            }
+        }
     }
 
     fn draw_service_tools(&mut self, ui: &mut egui::Ui) {
@@ -2243,6 +2575,8 @@ impl ZapretHubApp {
                 self.draw_profiles(ui);
                 ui.add_space(12.0);
                 self.draw_bundle_tests(ui);
+                ui.add_space(12.0);
+                self.draw_fake_files(ui);
             }
             AppTab::Telegram => {
                 self.draw_telegram_settings(ui);
@@ -2300,14 +2634,18 @@ impl eframe::App for ZapretHubApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
 
-        if self.close_after_stop && self.pending_action.is_none() && !self.runtime_is_active() {
+        if self.close_after_stop
+            && self.pending_action.is_none()
+            && !self.runtime_is_active()
+            && !self.bundle_test_waiting()
+        {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
         if self.pending_action.is_some()
             || self.tg_proxy_task.is_some()
             || self.bundle_task.is_some()
-            || self.bundle_test.launched_after.is_some()
+            || self.bundle_test_waiting()
         {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -2322,7 +2660,10 @@ impl eframe::App for ZapretHubApp {
                     "Сначала дождитесь завершения обновления bundle, потом закрывайте окно."
                         .to_owned()
                 } else if self.bundle_test_waiting() {
-                    "Сначала дождитесь завершения теста профилей, потом закрывайте окно.".to_owned()
+                    self.close_after_stop = true;
+                    self.cancel_bundle_test();
+                    "Отменяю тест профилей и восстанавливаю его состояние перед закрытием."
+                        .to_owned()
                 } else {
                     "Сначала дождитесь завершения текущей команды, потом закрывайте окно."
                         .to_owned()

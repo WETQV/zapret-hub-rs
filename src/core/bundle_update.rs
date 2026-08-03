@@ -46,6 +46,9 @@ const PRESERVED_RELATIVE_FILES: &[&str] = &[
     r"lists\list-general-user.txt",
     r"lists\list-exclude-user.txt",
     r"lists\ipset-exclude-user.txt",
+    r"bin\ACTIVE_DISCORD_UDP.bin",
+    r"bin\ACTIVE_GAME_UDP.bin",
+    r"utils\game_filter.enabled",
     "tgproxy-runtime.log",
     "tgproxy-launch.log",
 ];
@@ -1071,6 +1074,26 @@ mod tests {
             "changed after prepare"
         );
         assert!(!work_dir.exists());
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn preserve_user_files_keeps_fake_files_and_game_filter_state() -> Result<()> {
+        let root = temp_root("zapret-hub-preserve-runtime-files-test")?;
+        let current = root.join("current");
+        let staged = root.join("staged");
+        for relative in PRESERVED_RELATIVE_FILES {
+            let source = current.join(relative);
+            fs::create_dir_all(source.parent().expect("parent"))?;
+            fs::write(&source, relative.as_bytes())?;
+        }
+
+        preserve_user_files(&current, &staged)?;
+        for relative in PRESERVED_RELATIVE_FILES {
+            assert_eq!(fs::read(staged.join(relative))?, relative.as_bytes());
+        }
 
         fs::remove_dir_all(root)?;
         Ok(())

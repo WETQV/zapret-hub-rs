@@ -19,25 +19,13 @@ pub(crate) struct RuntimeStatus {
 }
 
 pub(crate) fn refresh_runtime_status(bundle_path: &Path) -> RuntimeStatus {
+    let process_output = run_hidden_command_output("tasklist", &[], bundle_path)
+        .map(|output| String::from_utf8_lossy(&output.stdout).to_ascii_lowercase())
+        .unwrap_or_default();
     RuntimeStatus {
-        winws_running: is_process_running(bundle_path, "winws.exe"),
-        telegram_proxy_running: is_process_running(bundle_path, "TgWsProxy_windows.exe"),
+        winws_running: process_output.contains("winws.exe"),
+        telegram_proxy_running: process_output.contains("tgwsproxy_windows.exe"),
         service_state: detect_service_state(bundle_path, "zapret"),
-    }
-}
-
-fn is_process_running(current_dir: &Path, image_name: &str) -> bool {
-    let output = run_hidden_command_output(
-        "tasklist",
-        &["/FI", &format!("IMAGENAME eq {image_name}")],
-        current_dir,
-    );
-
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .to_ascii_lowercase()
-            .contains(&image_name.to_ascii_lowercase()),
-        Err(_) => false,
     }
 }
 

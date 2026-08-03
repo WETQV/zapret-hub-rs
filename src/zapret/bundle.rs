@@ -2,7 +2,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -37,6 +37,7 @@ const TELEGRAM_PROXY_SCRIPT_NAME: &str = "telegram_proxy.cmd";
 const TELEGRAM_PROXY_SILENT_SCRIPT_NAME: &str = "start_telegram_proxy_silent.cmd";
 pub(crate) const TELEGRAM_PROXY_LOG_FILE_NAME: &str = "tgproxy-runtime.log";
 pub(crate) const TELEGRAM_PROXY_LAUNCH_LOG_FILE_NAME: &str = "tgproxy-launch.log";
+const STOP_RUNTIME_TIMEOUT: Duration = Duration::from_secs(8);
 const TELEGRAM_PROXY_STANDARD_ARGS: &str =
     "--dc-ip 2:149.154.167.220 --dc-ip 4:149.154.167.220 --dc-ip 203:149.154.167.220";
 const TELEGRAM_PROXY_CF_MEDIA_ARGS_PREFIX: &str = "--dc-ip 4:149.154.167.220 --cfproxy-domain ";
@@ -498,21 +499,35 @@ fn run_hidden_script(bundle_path: &Path, script_name: &str) -> Result<()> {
 }
 
 fn stop_runtime(bundle_path: &Path) -> Result<()> {
-    request_service_stop(bundle_path, "zapret");
-    request_process_stop(bundle_path, "winws.exe");
-    request_process_stop(bundle_path, "TgWsProxy_windows.exe");
-    request_service_stop(bundle_path, "WinDivert");
-    request_service_stop(bundle_path, "WinDivert14");
-
-    let remaining = remaining_runtime_items(bundle_path);
+    request_runtime_stop(bundle_path);
+    let deadline = Instant::now() + STOP_RUNTIME_TIMEOUT;
+    let mut retried = false;
+    let mut remaining = remaining_runtime_items(bundle_path);
+    while !remaining.is_empty() && Instant::now() < deadline {
+        if !retried && Instant::now() + Duration::from_secs(4) >= deadline {
+            request_runtime_stop(bundle_path);
+            retried = true;
+        }
+        thread::sleep(Duration::from_millis(250));
+        remaining = remaining_runtime_items(bundle_path);
+    }
     if !remaining.is_empty() {
         return Err(anyhow!(
-            "не удалось полностью остановить runtime: {}",
+            "не удалось остановить runtime за 8 секунд: {}",
             remaining.join("; ")
         ));
     }
 
     Ok(())
+}
+
+fn request_runtime_stop(bundle_path: &Path) {
+    for service_name in ["zapret", "WinDivert", "WinDivert14"] {
+        try_run_hidden_command("sc", &["stop", service_name], bundle_path);
+    }
+    for image_name in ["winws.exe", "TgWsProxy_windows.exe"] {
+        try_run_hidden_command("taskkill", &["/IM", image_name, "/T", "/F"], bundle_path);
+    }
 }
 
 fn remove_service(bundle_path: &Path) -> Result<()> {
@@ -524,62 +539,8 @@ fn remove_service(bundle_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn request_service_stop(bundle_path: &Path, service_name: &str) {
-    let Ok(Some(ServiceState::Running | ServiceState::StopPending | ServiceState::Unknown)) =
-        query_service_state(bundle_path, service_name)
-    else {
-        return;
-    };
-
-    try_run_hidden_command("net", &["stop", service_name], bundle_path);
-    if wait_for_service_stop(bundle_path, service_name, 20) {
-        return;
-    }
-
-    try_run_hidden_command("sc", &["stop", service_name], bundle_path);
-    let _ = wait_for_service_stop(bundle_path, service_name, 10);
-}
-
-fn wait_for_service_stop(bundle_path: &Path, service_name: &str, attempts: usize) -> bool {
-    for _ in 0..attempts {
-        match query_service_state(bundle_path, service_name) {
-            Ok(Some(ServiceState::Stopped | ServiceState::NotInstalled)) | Ok(None) => {
-                return true;
-            }
-            _ => thread::sleep(Duration::from_millis(500)),
-        }
-    }
-
-    false
-}
-
 fn delete_service_if_present(bundle_path: &Path, service_name: &str) {
     let _ = run_hidden_command_wait("sc", &["delete", service_name], bundle_path);
-}
-
-fn request_process_stop(bundle_path: &Path, image_name: &str) {
-    for _ in 0..3 {
-        if !is_process_running(bundle_path, image_name) {
-            return;
-        }
-
-        try_run_hidden_command("taskkill", &["/IM", image_name, "/T", "/F"], bundle_path);
-        if wait_for_process_stop(bundle_path, image_name, 10) {
-            return;
-        }
-    }
-}
-
-fn wait_for_process_stop(bundle_path: &Path, image_name: &str, attempts: usize) -> bool {
-    for _ in 0..attempts {
-        if !is_process_running(bundle_path, image_name) {
-            return true;
-        }
-
-        thread::sleep(Duration::from_millis(300));
-    }
-
-    false
 }
 
 fn remaining_runtime_items(bundle_path: &Path) -> Vec<String> {
@@ -595,26 +556,16 @@ fn remaining_runtime_items(bundle_path: &Path) -> Vec<String> {
         }
     }
 
+    let process_output = run_hidden_command_output("tasklist", &[], bundle_path)
+        .map(|output| output.stdout)
+        .unwrap_or_default();
     for image_name in ["winws.exe", "TgWsProxy_windows.exe"] {
-        if is_process_running(bundle_path, image_name) {
+        if tasklist_output_has_process(&process_output, image_name) {
             remaining.push(format!("process {image_name} is still running"));
         }
     }
 
     remaining
-}
-
-fn is_process_running(bundle_path: &Path, image_name: &str) -> bool {
-    let output = run_hidden_command_output(
-        "tasklist",
-        &["/FI", &format!("IMAGENAME eq {image_name}")],
-        bundle_path,
-    );
-
-    match output {
-        Ok(output) => tasklist_output_has_process(&output.stdout, image_name),
-        Err(_) => false,
-    }
 }
 
 fn tasklist_output_has_process(output: &[u8], image_name: &str) -> bool {
@@ -919,6 +870,11 @@ winws.exe                    1234 Console                    1      1,024 K\r\n"
             output,
             "TgWsProxy_windows.exe"
         ));
+    }
+
+    #[test]
+    fn runtime_stop_uses_one_eight_second_deadline() {
+        assert_eq!(STOP_RUNTIME_TIMEOUT, Duration::from_secs(8));
     }
 
     #[test]
