@@ -18,7 +18,7 @@ The application first looks for `bundle/` next to the installed executable.
 Run:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\packaging\build-installer.ps1
+powershell -ExecutionPolicy Bypass -File .\packaging\build-installer.ps1 -BundleTag 1.10.0 -TelegramProxyTag v1.9.1
 ```
 
 Optional custom bundle source:
@@ -42,6 +42,8 @@ Current update support is installer-based:
 - distribute the new installer
 
 Installing a newer version upgrades the existing install in place.
+
+Before replacing `bundle/`, the installer backs up and then restores user-owned lists, `ACTIVE_DISCORD_UDP.bin`, `ACTIVE_GAME_UDP.bin`, Game Filter state, and diagnostic logs. A failed restore leaves its timestamped backup next to the installation for recovery.
 
 `latest.json` is generated so a future app-side update checker can compare versions against a hosted manifest.
 

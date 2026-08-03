@@ -1,6 +1,8 @@
 param(
     [string]$BundlePath,
-    [string]$StageRoot = "dist\stage"
+    [string]$StageRoot = "dist\stage",
+    [string]$BundleTag = "1.10.0",
+    [string]$TelegramProxyTag = "v1.9.1"
 )
 
 $ErrorActionPreference = "Stop"
@@ -16,8 +18,8 @@ $exeSource = Join-Path $projectRoot "target\release\zapret-hub-rs.exe"
 $exeTarget = Join-Path $stagePath "Zapret Hub.exe"
 $whitelistSource = Join-Path $projectRoot "assets\builtin-whitelist.txt"
 $whitelistTarget = Join-Path $stagePath "builtin-whitelist.txt"
-$bundleReleaseApi = "https://api.github.com/repos/Flowseal/zapret-discord-youtube/releases/latest"
-$tgProxyReleaseApi = "https://api.github.com/repos/Flowseal/tg-ws-proxy/releases/latest"
+$bundleReleaseApi = "https://api.github.com/repos/Flowseal/zapret-discord-youtube/releases/tags/$BundleTag"
+$tgProxyReleaseApi = "https://api.github.com/repos/Flowseal/tg-ws-proxy/releases/tags/$TelegramProxyTag"
 $tgProxyAssetName = "TgWsProxy_windows.exe"
 $tgProxyVersionFileName = "TgWsProxy_windows.version.json"
 $bundleVersionFileName = "ZapretBundle.version.json"
@@ -89,6 +91,28 @@ function Test-BundleRoot {
         -and (Test-Path (Join-Path $Path "general (SIMPLE FAKE ALT2).bat"))
 }
 
+function Assert-StagedBundle {
+    param([string]$BundleRoot)
+
+    foreach ($requiredPath in @("bin\winws.exe", "lists", "service.bat")) {
+        if (-not (Test-Path -LiteralPath (Join-Path $BundleRoot $requiredPath))) {
+            throw "Staged bundle is missing required path: $requiredPath"
+        }
+    }
+
+    $profileScripts = @(Get-ChildItem -LiteralPath $BundleRoot -File -Filter "general*.bat")
+    if ($profileScripts.Count -eq 0) {
+        throw "Staged bundle does not contain general*.bat profiles"
+    }
+
+    foreach ($script in $profileScripts) {
+        $content = [System.IO.File]::ReadAllText($script.FullName, [System.Text.Encoding]::UTF8)
+        if ($content -notlike '*start "" /B "%BIN%winws.exe"*') {
+            throw "Profile launcher was not patched for hidden winws start: $($script.Name)"
+        }
+    }
+}
+
 function Find-BundleRoot {
     param([string]$ExtractRoot)
 
@@ -132,7 +156,7 @@ function Resolve-BundleSource {
     $assetName = "zapret-discord-youtube-$($release.tag_name).zip"
     $asset = $release.assets | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
     if (-not $asset) {
-        throw "Latest bundle zip asset not found in GitHub release metadata: $assetName"
+        throw "Pinned bundle zip asset not found in GitHub release metadata: $assetName"
     }
 
     $downloadRoot = Join-Path ([System.IO.Path]::GetTempPath()) "zapret-hub-bundle-$([guid]::NewGuid())"
@@ -527,7 +551,7 @@ function Update-StagedTelegramProxy {
     $asset = $release.assets | Where-Object { $_.name -eq $tgProxyAssetName } | Select-Object -First 1
 
     if (-not $asset) {
-        throw "Latest tg-ws-proxy Windows asset not found in GitHub release metadata"
+        throw "Pinned tg-ws-proxy Windows asset not found in GitHub release metadata"
     }
 
     $targetPath = Join-Path $BundleRoot $tgProxyAssetName
@@ -609,6 +633,7 @@ try {
         -SourceFolder $resolvedBundle.SourceFolder
     Update-StagedTelegramProxy -BundleRoot $bundleTarget
     Patch-StagedBundle -BundleRoot $bundleTarget
+    Assert-StagedBundle -BundleRoot $bundleTarget
 }
 finally {
     if ($resolvedBundle.CleanupRoot -and (Test-Path $resolvedBundle.CleanupRoot)) {

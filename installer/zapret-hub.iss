@@ -67,6 +67,9 @@ Filename: "{app}\Zapret Hub.exe"; Description: "Launch Zapret Hub"; Flags: nowai
 Type: filesandordirs; Name: "{app}\bundle"
 
 [Code]
+var
+  BundleBackupDir: String;
+
 function ExecQuiet(const Params: string): Boolean;
 var
   ResultCode: Integer;
@@ -87,7 +90,7 @@ begin
   ExecQuiet('taskkill /FI "WINDOWTITLE eq zapret:*" /T /F');
   ExecQuiet('taskkill /IM winws.exe /T /F');
   ExecQuiet('taskkill /IM TgWsProxy_windows.exe /T /F');
-  ExecQuiet('net stop zapret');
+  ExecQuiet('sc stop zapret');
   ExecQuiet('sc stop WinDivert');
   ExecQuiet('sc stop WinDivert14');
   ExecQuiet('sc delete zapret');
@@ -95,10 +98,81 @@ begin
   ExecQuiet('sc delete WinDivert14');
 end;
 
+procedure BackupBundleFile(const RelativePath: String);
+var
+  SourcePath, TargetPath: String;
+begin
+  SourcePath := ExpandConstant('{app}\bundle\') + RelativePath;
+  if not FileExists(SourcePath) then
+    exit;
+
+  TargetPath := AddBackslash(BundleBackupDir) + RelativePath;
+  ForceDirectories(ExtractFileDir(TargetPath));
+  if not CopyFile(SourcePath, TargetPath, False) then
+    Log('Could not back up bundle file: ' + SourcePath);
+end;
+
+procedure BackUpUserBundleFiles();
+begin
+  BundleBackupDir := ExpandConstant('{app}\bundle-user-backup-') +
+    GetDateTimeString('yyyymmddhhnnsszzz', '-', ':');
+  BackupBundleFile('lists\list-general-user.txt');
+  BackupBundleFile('lists\list-exclude-user.txt');
+  BackupBundleFile('lists\ipset-exclude-user.txt');
+  BackupBundleFile('bin\ACTIVE_DISCORD_UDP.bin');
+  BackupBundleFile('bin\ACTIVE_GAME_UDP.bin');
+  BackupBundleFile('utils\game_filter.enabled');
+  BackupBundleFile('tgproxy-runtime.log');
+  BackupBundleFile('tgproxy-launch.log');
+end;
+
+function RestoreBundleFile(const RelativePath: String): Boolean;
+var
+  SourcePath, TargetPath: String;
+begin
+  Result := True;
+  SourcePath := AddBackslash(BundleBackupDir) + RelativePath;
+  if not FileExists(SourcePath) then
+    exit;
+
+  TargetPath := ExpandConstant('{app}\bundle\') + RelativePath;
+  ForceDirectories(ExtractFileDir(TargetPath));
+  Result := CopyFile(SourcePath, TargetPath, False);
+  if not Result then
+    Log('Could not restore bundle file: ' + TargetPath);
+end;
+
+procedure RestoreUserBundleFiles();
+var
+  Restored: Boolean;
+begin
+  if (BundleBackupDir = '') or not DirExists(BundleBackupDir) then
+    exit;
+
+  Restored :=
+    RestoreBundleFile('lists\list-general-user.txt') and
+    RestoreBundleFile('lists\list-exclude-user.txt') and
+    RestoreBundleFile('lists\ipset-exclude-user.txt') and
+    RestoreBundleFile('bin\ACTIVE_DISCORD_UDP.bin') and
+    RestoreBundleFile('bin\ACTIVE_GAME_UDP.bin') and
+    RestoreBundleFile('utils\game_filter.enabled') and
+    RestoreBundleFile('tgproxy-runtime.log') and
+    RestoreBundleFile('tgproxy-launch.log');
+
+  if Restored then
+    DelTree(BundleBackupDir, True, True, True)
+  else
+    Log('Bundle backup remains available for manual recovery: ' + BundleBackupDir);
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
-  if CurStep = ssInstall then
+  if CurStep = ssInstall then begin
     StopZapretRuntime();
+    BackUpUserBundleFiles();
+  end;
+  if CurStep = ssPostInstall then
+    RestoreUserBundleFiles();
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

@@ -53,6 +53,9 @@ Zapret Hub/
   - `ALT7`
 - запуск Telegram proxy
 - действие «остановить всё» для известных связанных процессов
+- общий дедлайн остановки runtime в 8 секунд с понятной ошибкой, если что-то осталось активно
+- нативный поиск лучшего профиля без окна PowerShell: обычный HTTP/TLS/ping и расширенный DPI 16–20 КБ режим
+- выбор отдельных UDP fake-файлов для Discord Voice и GameFilter
 - сервисные действия:
   - установить сервис
   - удалить сервис
@@ -137,6 +140,12 @@ cargo build --release
 powershell -ExecutionPolicy Bypass -File .\packaging\build-installer.ps1
 ```
 
+По умолчанию release-скрипт фиксирует Flowseal `1.10.0` и TG WS Proxy `v1.9.1`. При необходимости их можно указать явно:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\packaging\build-installer.ps1 -BundleTag 1.10.0 -TelegramProxyTag v1.9.1
+```
+
 Если использовать свой путь к bundle:
 
 ```powershell
@@ -152,6 +161,7 @@ powershell -ExecutionPolicy Bypass -File .\packaging\build-installer.ps1 -Bundle
 
 - распространять нужно инсталлер, а не только `.exe`
 - новый инсталлер обновляет существующую установку поверх старой
+- при обновлении сохраняются пользовательские general/exclude/ipset-exclude списки, оба `ACTIVE_*_UDP.bin`, состояние Game Filter и диагностические логи
 - `AppId` в Inno Setup должен оставаться тем же
 - перед релизом нужно повышать `version` в `Cargo.toml`
 

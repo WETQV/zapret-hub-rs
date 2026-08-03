@@ -1,5 +1,7 @@
 param(
-    [string]$BundlePath
+    [string]$BundlePath,
+    [string]$BundleTag = "1.10.0",
+    [string]$TelegramProxyTag = "v1.9.1"
 )
 
 $ErrorActionPreference = "Stop"
@@ -48,6 +50,8 @@ $stageArgs = @{}
 if ($PSBoundParameters.ContainsKey("BundlePath")) {
     $stageArgs.BundlePath = $BundlePath
 }
+$stageArgs.BundleTag = $BundleTag
+$stageArgs.TelegramProxyTag = $TelegramProxyTag
 
 & $stageScript @stageArgs
 
