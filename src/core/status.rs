@@ -36,23 +36,63 @@ fn detect_service_state(current_dir: &Path, service_name: &str) -> ServiceState 
         return ServiceState::Unknown;
     };
 
-    let text = String::from_utf8_lossy(&output.stdout).to_ascii_uppercase();
+    parse_service_state(&output.stdout, &output.stderr)
+}
 
-    if text.contains("FAILED 1060") || text.contains("DOES NOT EXIST") {
+fn parse_service_state(stdout: &[u8], stderr: &[u8]) -> ServiceState {
+    let output = String::from_utf8_lossy(stdout).to_ascii_uppercase();
+    let error = String::from_utf8_lossy(stderr).to_ascii_uppercase();
+
+    if output.contains("FAILED 1060")
+        || output.contains("DOES NOT EXIST")
+        || error.contains("FAILED 1060")
+        || error.contains("DOES NOT EXIST")
+    {
         return ServiceState::NotInstalled;
     }
 
-    if text.contains("RUNNING") {
+    if output.contains("RUNNING") {
         return ServiceState::Running;
     }
 
-    if text.contains("STOP_PENDING") {
+    if output.contains("STOP_PENDING") {
         return ServiceState::StopPending;
     }
 
-    if text.contains("STOPPED") {
+    if output.contains("STOPPED") {
         return ServiceState::Stopped;
     }
 
     ServiceState::Unknown
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_service_is_detected_from_stderr() {
+        let state = parse_service_state(
+            b"",
+            b"[SC] EnumQueryServicesStatus:OpenService FAILED 1060:\r\nThe specified service does not exist as an installed service.",
+        );
+
+        assert_eq!(state, ServiceState::NotInstalled);
+    }
+
+    #[test]
+    fn installed_service_states_are_detected_from_stdout() {
+        assert_eq!(
+            parse_service_state(b"STATE : 1 STOPPED", b""),
+            ServiceState::Stopped
+        );
+        assert_eq!(
+            parse_service_state(b"STATE : 3 STOP_PENDING", b""),
+            ServiceState::StopPending
+        );
+        assert_eq!(
+            parse_service_state(b"STATE : 4 RUNNING", b""),
+            ServiceState::Running
+        );
+    }
 }
