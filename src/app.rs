@@ -1131,10 +1131,6 @@ impl ZapretHubApp {
         }
     }
 
-    fn service_allows_profile_test(state: ServiceState) -> bool {
-        matches!(state, ServiceState::NotInstalled | ServiceState::Stopped)
-    }
-
     fn describe_action_result(&self, action: BundleAction, action_message: String) -> String {
         match action {
             BundleAction::StopAll => {
@@ -1195,15 +1191,6 @@ impl ZapretHubApp {
         }
         if self.runtime_is_active() {
             return Some("Остановите текущий профиль или сервис перед тестом bundle.".to_owned());
-        }
-        if !Self::service_allows_profile_test(self.status.service_state) {
-            return Some(match self.status.service_state {
-                ServiceState::Unknown => {
-                    "Не удалось определить состояние службы zapret. Обновите статус и повторите."
-                }
-                _ => "Остановите службу zapret перед тестом профилей.",
-            }
-            .to_owned());
         }
         if !self.bundle_path.join("bin").join("winws.exe").is_file() {
             return Some("В текущем bundle нет bin\\winws.exe.".to_owned());
@@ -2856,28 +2843,4 @@ fn apply_custom_style(ctx: &egui::Context) {
     style.visuals.menu_corner_radius = CornerRadius::same(12);
 
     ctx.set_style(style);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stopped_service_does_not_block_profile_test() {
-        assert!(ZapretHubApp::service_allows_profile_test(
-            ServiceState::Stopped
-        ));
-        assert!(ZapretHubApp::service_allows_profile_test(
-            ServiceState::NotInstalled
-        ));
-        assert!(!ZapretHubApp::service_allows_profile_test(
-            ServiceState::Running
-        ));
-        assert!(!ZapretHubApp::service_allows_profile_test(
-            ServiceState::StopPending
-        ));
-        assert!(!ZapretHubApp::service_allows_profile_test(
-            ServiceState::Unknown
-        ));
-    }
 }
