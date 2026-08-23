@@ -8,6 +8,8 @@ use eframe::egui;
 use eframe::egui::IconData;
 use image::ImageFormat;
 
+const APP_WINDOW_TITLE: &str = "Zapret Hub";
+
 fn main() -> eframe::Result {
     let launch_mode = LaunchMode::detect();
 
@@ -33,7 +35,7 @@ fn main() -> eframe::Result {
     };
 
     eframe::run_native(
-        "Zapret Hub",
+        APP_WINDOW_TITLE,
         native_options,
         Box::new(move |cc| Ok(Box::new(app::ZapretHubApp::new(cc, launch_mode)))),
     )
@@ -76,10 +78,10 @@ impl SingleInstanceGuard {
             unsafe {
                 CloseHandle(handle);
             }
-            if show_existing_instance_message {
+            if show_existing_instance_message && !activate_existing_window() {
                 show_info_message(
                     "Zapret Hub уже запущен",
-                    "Второй экземпляр приложения не будет открыт.",
+                    "Приложение уже работает, но его окно пока не удалось восстановить.",
                 );
             }
             return Ok(None);
@@ -87,6 +89,35 @@ impl SingleInstanceGuard {
 
         Ok(Some(Self(handle)))
     }
+}
+
+#[cfg(windows)]
+fn activate_existing_window() -> bool {
+    use std::time::Duration;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, IsIconic, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow,
+    };
+
+    let title = to_wide(APP_WINDOW_TITLE);
+    for _ in 0..20 {
+        let window = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
+        if !window.is_null() {
+            unsafe {
+                let show_command = if IsIconic(window) != 0 {
+                    SW_RESTORE
+                } else {
+                    SW_SHOW
+                };
+                ShowWindow(window, show_command);
+                SetForegroundWindow(window);
+            }
+            return true;
+        }
+
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    false
 }
 
 #[cfg(windows)]
