@@ -38,6 +38,14 @@ $githubHostlistEntries = @(
     "camo.githubusercontent.com",
     "user-images.githubusercontent.com"
 )
+$profileTestPingTargets = @(
+    'Cloudflare = "PING:1.1.1.1"',
+    'Google = "PING:8.8.8.8"',
+    'Quad9 = "PING:9.9.9.9"',
+    'DNSWATCH = "PING:84.200.69.80"',
+    'AdGuard = "PING:94.140.14.14"'
+)
+$profileTestTargetsHeading = "### Public network endpoints (PING-only, not used as DNS resolvers)"
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $telegramProxyScript = @"
 @echo off
@@ -109,6 +117,16 @@ function Assert-StagedBundle {
         $content = [System.IO.File]::ReadAllText($script.FullName, [System.Text.Encoding]::UTF8)
         if ($content -notlike '*start "" /B "%BIN%winws.exe"*') {
             throw "Profile launcher was not patched for hidden winws start: $($script.Name)"
+        }
+    }
+
+    $targetsContent = [System.IO.File]::ReadAllText(
+        (Join-Path $BundleRoot "utils\targets.txt"),
+        [System.Text.Encoding]::UTF8
+    )
+    foreach ($target in $profileTestPingTargets) {
+        if (-not $targetsContent.Contains($target)) {
+            throw "Staged profile test targets are missing: $target"
         }
     }
 }
@@ -512,11 +530,40 @@ function Disable-UpstreamUpdateChecks {
     Remove-Sha256SumEntry -BundleRoot $BundleRoot -RelativePath $upstreamUpdateCheckFlagRelativePath
 }
 
+function Update-StagedProfileTestTargets {
+    param([string]$BundleRoot)
+
+    $targetsPath = Join-Path $BundleRoot "utils\targets.txt"
+    $lines = if (Test-Path -LiteralPath $targetsPath) {
+        [System.IO.File]::ReadAllLines($targetsPath, [System.Text.Encoding]::UTF8) |
+            Where-Object {
+                $_ -notmatch '=\s*"PING:' `
+                    -and $_.Trim() -ne "### Public DNS (PING-only)" `
+                    -and $_.Trim() -ne $profileTestTargetsHeading
+            }
+    } else {
+        @()
+    }
+
+    $updated = [System.Collections.Generic.List[string]]::new()
+    $updated.AddRange([string[]]$lines)
+    while ($updated.Count -gt 0 -and [string]::IsNullOrWhiteSpace($updated[$updated.Count - 1])) {
+        $updated.RemoveAt($updated.Count - 1)
+    }
+    $updated.Add("")
+    $updated.Add($profileTestTargetsHeading)
+    $updated.AddRange([string[]]$profileTestPingTargets)
+
+    [System.IO.File]::WriteAllLines($targetsPath, $updated, $utf8NoBom)
+    Remove-Sha256SumEntry -BundleRoot $BundleRoot -RelativePath "utils\targets.txt"
+}
+
 function Patch-StagedBundle {
     param([string]$BundleRoot)
 
     Ensure-HubScripts -BundleRoot $BundleRoot
     Add-StagedHostlistEntries -BundleRoot $BundleRoot -Entries $githubHostlistEntries
+    Update-StagedProfileTestTargets -BundleRoot $BundleRoot
     Disable-UpstreamUpdateChecks -BundleRoot $BundleRoot
 
     $profileScripts = Get-ChildItem -LiteralPath $BundleRoot -File -Filter "general*.bat"

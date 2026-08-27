@@ -9,6 +9,14 @@ use anyhow::{Context, Result, anyhow};
 
 use crate::zapret::bundle::BundleProfile;
 
+pub(crate) const PROFILE_TEST_PING_TARGETS: &[(&str, &str, &str)] = &[
+    ("Cloudflare", "Cloudflare / сеть", "1.1.1.1"),
+    ("Google", "Google / сеть", "8.8.8.8"),
+    ("Quad9", "Quad9 / сеть", "9.9.9.9"),
+    ("DNSWATCH", "DNS.WATCH / сеть", "84.200.69.80"),
+    ("AdGuard", "AdGuard / сеть", "94.140.14.14"),
+];
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum ProfileTestMode {
     #[default]
@@ -232,16 +240,23 @@ fn parse_target(line: &str) -> Option<Target> {
 }
 
 fn default_targets() -> Vec<Target> {
-    [
+    let mut targets = [
         ("Discord", "https://discord.com"),
         ("YouTube", "https://www.youtube.com"),
         ("Cloudflare", "https://www.cloudflare.com"),
-        ("Cloudflare DNS", "PING:1.1.1.1"),
-        ("Google DNS", "PING:8.8.8.8"),
     ]
     .into_iter()
     .filter_map(|(name, value)| parse_target(&format!("{name} = \"{value}\"")))
-    .collect()
+    .collect::<Vec<_>>();
+
+    targets.extend(
+        PROFILE_TEST_PING_TARGETS
+            .iter()
+            .filter_map(|(_, label, address)| {
+                parse_target(&format!("{label} = \"PING:{address}\""))
+            }),
+    );
+    targets
 }
 
 fn load_dpi_targets() -> Result<Vec<Target>> {
@@ -613,6 +628,23 @@ mod tests {
         let target = parse_target("Cloudflare = \"PING:1.1.1.1\"").unwrap();
         assert!(target.ping_only);
         assert_eq!(target.value, "1.1.1.1");
+    }
+
+    #[test]
+    fn default_ping_targets_use_independent_providers() {
+        let ping_targets = default_targets()
+            .into_iter()
+            .filter(|target| target.ping_only)
+            .collect::<Vec<_>>();
+
+        assert_eq!(ping_targets.len(), PROFILE_TEST_PING_TARGETS.len());
+        for (_, label, address) in PROFILE_TEST_PING_TARGETS {
+            assert!(
+                ping_targets
+                    .iter()
+                    .any(|target| target.name == *label && target.value == *address)
+            );
+        }
     }
     #[test]
     fn ranks_standard_by_success_then_error() {

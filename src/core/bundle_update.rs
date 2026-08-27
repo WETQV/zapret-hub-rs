@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::core::bundle_metadata::detect_bundle_version;
 use crate::core::paths::is_valid_bundle_dir;
+use crate::core::profile_test::PROFILE_TEST_PING_TARGETS;
 use crate::core::tg_proxy_update::{
     check_for_update as check_tg_proxy_update, install_update as install_tg_proxy_update,
 };
@@ -24,6 +25,8 @@ const SHA256SUMS_FILE_NAME: &str = "SHA256SUMS.txt";
 const TG_PROXY_ASSET_NAME: &str = "TgWsProxy_windows.exe";
 const TG_PROXY_VERSION_FILE_NAME: &str = "TgWsProxy_windows.version.json";
 const UPSTREAM_UPDATE_CHECK_FLAG_RELATIVE_PATH: &str = "utils/check_updates.enabled";
+const PROFILE_TEST_TARGETS_HEADING: &str =
+    "### Public network endpoints (PING-only, not used as DNS resolvers)";
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -354,6 +357,7 @@ where
     }
     ensure_hub_scripts(staged_bundle)?;
     patch_profile_scripts(staged_bundle)?;
+    patch_profile_test_targets(staged_bundle)?;
     disable_upstream_update_checks(staged_bundle)?;
     add_hostlist_entries(
         staged_bundle
@@ -399,6 +403,55 @@ fn write_bundle_version_metadata(staged_bundle: &Path, version: &str) -> Result<
 
     fs::write(staged_bundle.join(BUNDLE_VERSION_FILE_NAME), content)
         .context("failed to write bundle version metadata")
+}
+
+fn patch_profile_test_targets(bundle_root: &Path) -> Result<()> {
+    let targets_path = bundle_root.join("utils").join("targets.txt");
+    let content = fs::read_to_string(&targets_path).unwrap_or_default();
+    let updated = patch_profile_test_targets_content(&content);
+    fs::create_dir_all(
+        targets_path
+            .parent()
+            .context("targets path has no parent")?,
+    )?;
+    fs::write(&targets_path, updated)
+        .with_context(|| format!("failed to write {}", targets_path.display()))?;
+    remove_sha256sum_entry(bundle_root, "utils/targets.txt")
+}
+
+fn patch_profile_test_targets_content(content: &str) -> String {
+    let mut lines = content
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            if trimmed == "### Public DNS (PING-only)" || trimmed == PROFILE_TEST_TARGETS_HEADING {
+                return false;
+            }
+            line.split_once('=')
+                .map(|(_, value)| {
+                    !value
+                        .trim()
+                        .trim_matches('"')
+                        .to_ascii_uppercase()
+                        .starts_with("PING:")
+                })
+                .unwrap_or(true)
+        })
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+    lines.push(String::new());
+    lines.push(PROFILE_TEST_TARGETS_HEADING.to_owned());
+    lines.extend(
+        PROFILE_TEST_PING_TARGETS
+            .iter()
+            .map(|(key, _, address)| format!("{key} = \"PING:{address}\"")),
+    );
+    lines.push(String::new());
+    lines.join("\r\n")
 }
 
 fn ensure_hub_scripts(bundle_root: &Path) -> Result<()> {
@@ -981,6 +1034,25 @@ mod tests {
         );
         assert!(updated.contains("objects.githubusercontent.com"));
         assert!(updated.ends_with('\n'));
+    }
+
+    #[test]
+    fn profile_test_targets_replace_duplicate_provider_endpoints() {
+        let content = "Discord = \"https://discord.com\"\r\nCloudflare1 = \"PING:1.1.1.1\"\r\nCloudflare2 = \"PING:1.0.0.1\"\r\n";
+
+        let updated = patch_profile_test_targets_content(content);
+
+        assert!(updated.contains("Discord = \"https://discord.com\""));
+        assert!(!updated.contains("1.0.0.1"));
+        for (key, _, address) in PROFILE_TEST_PING_TARGETS {
+            assert!(updated.contains(&format!("{key} = \"PING:{address}\"")));
+        }
+        assert_eq!(
+            patch_profile_test_targets_content(&updated)
+                .matches(PROFILE_TEST_TARGETS_HEADING)
+                .count(),
+            1
+        );
     }
 
     #[test]
