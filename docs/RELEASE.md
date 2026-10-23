@@ -13,7 +13,15 @@ Zapret Hub/
 
 The application first looks for `bundle/` next to the installed executable.
 
-## Build
+## Release with GitHub Actions (recommended)
+
+1. Bump `version` in `Cargo.toml`, write `docs/RELEASE_NOTES_<version>.md`, merge to `main`.
+2. Tag and push: `git tag v<version> && git push origin v<version>`.
+3. The `Build release packages` workflow builds the installer and the portable zip on a
+   Windows runner and attaches them (plus `latest.json`) to the release, creating it from the
+   release notes if needed. It can also be started by hand from the Actions tab.
+
+Manual build:
 
 On Linux (cross-compiled, produces the staged app and a portable zip):
 
