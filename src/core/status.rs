@@ -1,8 +1,13 @@
-use std::path::Path;
+//! Runtime status straight from Win32 (process snapshot + service manager).
+//! Polling used to spawn `tasklist` and `sc query` every two seconds.
 
-use crate::core::process::run_hidden_command_output;
+pub(crate) const WINWS_IMAGE: &str = "winws.exe";
+pub(crate) const TG_PROXY_IMAGE: &str = "TgWsProxy_windows.exe";
+pub(crate) const ZAPRET_SERVICE: &str = "zapret";
+pub(crate) const WINDIVERT_SERVICES: [&str; 2] = ["WinDivert", "WinDivert14"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) enum ServiceState {
     Unknown,
     NotInstalled,
@@ -11,59 +16,134 @@ pub(crate) enum ServiceState {
     Running,
 }
 
-#[derive(Clone, Debug)]
+impl ServiceState {
+    pub(crate) fn is_active(self) -> bool {
+        matches!(self, Self::Running | Self::StopPending)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeStatus {
     pub(crate) winws_running: bool,
     pub(crate) telegram_proxy_running: bool,
     pub(crate) service_state: ServiceState,
 }
 
-pub(crate) fn refresh_runtime_status(bundle_path: &Path) -> RuntimeStatus {
-    let process_output = run_hidden_command_output("tasklist", &[], bundle_path)
-        .map(|output| String::from_utf8_lossy(&output.stdout).to_ascii_lowercase())
-        .unwrap_or_default();
-    RuntimeStatus {
-        winws_running: process_output.contains("winws.exe"),
-        telegram_proxy_running: process_output.contains("tgwsproxy_windows.exe"),
-        service_state: detect_service_state(bundle_path, "zapret"),
+impl Default for RuntimeStatus {
+    fn default() -> Self {
+        Self {
+            winws_running: false,
+            telegram_proxy_running: false,
+            service_state: ServiceState::Unknown,
+        }
     }
 }
 
-fn detect_service_state(current_dir: &Path, service_name: &str) -> ServiceState {
-    let output = run_hidden_command_output("sc", &["query", service_name], current_dir);
+impl RuntimeStatus {
+    pub(crate) fn is_active(&self) -> bool {
+        self.winws_running || self.telegram_proxy_running || self.service_state.is_active()
+    }
+}
 
-    let Ok(output) = output else {
-        return ServiceState::Unknown;
+pub(crate) fn refresh_runtime_status() -> RuntimeStatus {
+    let processes = running_process_names();
+    RuntimeStatus {
+        winws_running: has_process(&processes, WINWS_IMAGE),
+        telegram_proxy_running: has_process(&processes, TG_PROXY_IMAGE),
+        service_state: query_service_state(ZAPRET_SERVICE),
+    }
+}
+
+pub(crate) fn has_process(names: &[String], image_name: &str) -> bool {
+    names
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(image_name))
+}
+
+#[cfg(windows)]
+pub(crate) fn running_process_names() -> Vec<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
     };
 
-    parse_service_state(&output.stdout, &output.stderr)
+    let mut names = Vec::new();
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return names;
+        }
+
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut ok = Process32FirstW(snapshot, &mut entry) != 0;
+        while ok {
+            let len = entry
+                .szExeFile
+                .iter()
+                .position(|&ch| ch == 0)
+                .unwrap_or(entry.szExeFile.len());
+            names.push(String::from_utf16_lossy(&entry.szExeFile[..len]));
+            ok = Process32NextW(snapshot, &mut entry) != 0;
+        }
+        CloseHandle(snapshot);
+    }
+    names
 }
 
-fn parse_service_state(stdout: &[u8], stderr: &[u8]) -> ServiceState {
-    let output = String::from_utf8_lossy(stdout).to_ascii_uppercase();
-    let error = String::from_utf8_lossy(stderr).to_ascii_uppercase();
+#[cfg(not(windows))]
+pub(crate) fn running_process_names() -> Vec<String> {
+    Vec::new()
+}
 
-    if output.contains("FAILED 1060")
-        || output.contains("DOES NOT EXIST")
-        || error.contains("FAILED 1060")
-        || error.contains("DOES NOT EXIST")
-    {
-        return ServiceState::NotInstalled;
+#[cfg(windows)]
+pub(crate) fn query_service_state(service_name: &str) -> ServiceState {
+    use windows_sys::Win32::Foundation::{ERROR_SERVICE_DOES_NOT_EXIST, GetLastError};
+    use windows_sys::Win32::System::Services::{
+        CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatus, SC_MANAGER_CONNECT,
+        SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS,
+        SERVICE_STOP_PENDING, SERVICE_STOPPED,
+    };
+
+    let name: Vec<u16> = service_name.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        let manager = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
+        if manager.is_null() {
+            return ServiceState::Unknown;
+        }
+
+        let service = OpenServiceW(manager, name.as_ptr(), SERVICE_QUERY_STATUS);
+        if service.is_null() {
+            let error = GetLastError();
+            CloseServiceHandle(manager);
+            return if error == ERROR_SERVICE_DOES_NOT_EXIST {
+                ServiceState::NotInstalled
+            } else {
+                ServiceState::Unknown
+            };
+        }
+
+        let mut status: SERVICE_STATUS = std::mem::zeroed();
+        let ok = QueryServiceStatus(service, &mut status) != 0;
+        CloseServiceHandle(service);
+        CloseServiceHandle(manager);
+
+        if !ok {
+            return ServiceState::Unknown;
+        }
+        match status.dwCurrentState {
+            SERVICE_RUNNING | SERVICE_START_PENDING => ServiceState::Running,
+            SERVICE_STOP_PENDING => ServiceState::StopPending,
+            SERVICE_STOPPED => ServiceState::Stopped,
+            _ => ServiceState::Unknown,
+        }
     }
+}
 
-    if output.contains("RUNNING") {
-        return ServiceState::Running;
-    }
-
-    if output.contains("STOP_PENDING") {
-        return ServiceState::StopPending;
-    }
-
-    if output.contains("STOPPED") {
-        return ServiceState::Stopped;
-    }
-
-    ServiceState::Unknown
+#[cfg(not(windows))]
+pub(crate) fn query_service_state(_service_name: &str) -> ServiceState {
+    ServiceState::NotInstalled
 }
 
 #[cfg(test)]
@@ -71,28 +151,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn missing_service_is_detected_from_stderr() {
-        let state = parse_service_state(
-            b"",
-            b"[SC] EnumQueryServicesStatus:OpenService FAILED 1060:\r\nThe specified service does not exist as an installed service.",
-        );
-
-        assert_eq!(state, ServiceState::NotInstalled);
+    fn process_names_match_case_insensitively() {
+        let names = vec!["System".to_owned(), "WINWS.EXE".to_owned()];
+        assert!(has_process(&names, WINWS_IMAGE));
+        assert!(!has_process(&names, TG_PROXY_IMAGE));
     }
 
     #[test]
-    fn installed_service_states_are_detected_from_stdout() {
-        assert_eq!(
-            parse_service_state(b"STATE : 1 STOPPED", b""),
-            ServiceState::Stopped
-        );
-        assert_eq!(
-            parse_service_state(b"STATE : 3 STOP_PENDING", b""),
-            ServiceState::StopPending
-        );
-        assert_eq!(
-            parse_service_state(b"STATE : 4 RUNNING", b""),
-            ServiceState::Running
-        );
+    fn stop_pending_service_counts_as_active_runtime() {
+        let status = RuntimeStatus {
+            winws_running: false,
+            telegram_proxy_running: false,
+            service_state: ServiceState::StopPending,
+        };
+        assert!(status.is_active());
+        assert!(!RuntimeStatus::default().is_active());
     }
 }

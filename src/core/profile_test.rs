@@ -7,7 +7,21 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 
+use crate::core::bundle_update::patch_profile_script;
+use crate::core::process::hidden_command;
+use crate::core::status::{WINWS_IMAGE, has_process, running_process_names};
 use crate::zapret::bundle::BundleProfile;
+
+const PROFILE_WARMUP: Duration = Duration::from_secs(4);
+const WINWS_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub(crate) const PROFILE_TEST_PING_TARGETS: &[(&str, &str, &str)] = &[
+    ("Cloudflare", "Cloudflare / сеть", "1.1.1.1"),
+    ("Google", "Google / сеть", "8.8.8.8"),
+    ("Quad9", "Quad9 / сеть", "9.9.9.9"),
+    ("DNSWATCH", "DNS.WATCH / сеть", "84.200.69.80"),
+    ("AdGuard", "AdGuard / сеть", "94.140.14.14"),
+];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum ProfileTestMode {
@@ -92,18 +106,24 @@ pub(crate) fn start(
     });
 }
 
+/// Cheap checks that are fine on the UI thread.
 pub(crate) fn preflight(bundle_path: &Path, request: &ProfileTestRequest) -> Result<()> {
     if request.profiles.is_empty() {
         anyhow::bail!("выберите хотя бы один профиль");
     }
-    if !bundle_path.join("bin").join("winws.exe").is_file() {
+    if !bundle_path.join("bin").join(WINWS_IMAGE).is_file() {
         anyhow::bail!("в bundle не найден bin\\winws.exe");
     }
-    let curl = std::process::Command::new("where").arg("curl.exe").output();
+    Ok(())
+}
+
+/// Spawns processes, so it runs on the test thread.
+fn environment_checks() -> Result<()> {
+    let curl = hidden_command("where").arg("curl.exe").output();
     if !curl.is_ok_and(|output| output.status.success()) {
         anyhow::bail!("не найден curl.exe; обновите Windows или добавьте curl в PATH");
     }
-    let admin = std::process::Command::new("fltmc").arg("filters").output();
+    let admin = hidden_command("fltmc").arg("filters").output();
     if !admin.is_ok_and(|output| output.status.success()) {
         anyhow::bail!("перезапустите Zapret Hub от имени администратора");
     }
@@ -117,6 +137,7 @@ fn run(
     sender: &Sender<ProfileTestEvent>,
 ) -> Result<ProfileTestReport> {
     preflight(bundle_path, &request)?;
+    environment_checks()?;
     let _ = sender.send(ProfileTestEvent::Started {
         total: request.profiles.len(),
     });
@@ -131,8 +152,10 @@ fn run(
             total: request.profiles.len(),
             label: profile.label().to_owned(),
         });
+        // Two winws instances fighting over WinDivert would skew every following result.
+        stop_test_winws(bundle_path);
         start_profile(bundle_path, profile)?;
-        wait_with_cancellation(Duration::from_secs(5), cancelled)?;
+        wait_with_cancellation(PROFILE_WARMUP, cancelled)?;
         let row = run_profile_checks(
             bundle_path,
             profile,
@@ -218,6 +241,9 @@ fn load_targets(bundle_path: &Path, mode: ProfileTestMode) -> Result<Vec<Target>
 }
 
 fn parse_target(line: &str) -> Option<Target> {
+    if line.trim_start().starts_with('#') {
+        return None;
+    }
     let (name, value) = line.split_once('=')?;
     let value = value.trim().trim_matches('"');
     if name.trim().is_empty() || value.is_empty() || value.starts_with('#') {
@@ -232,16 +258,23 @@ fn parse_target(line: &str) -> Option<Target> {
 }
 
 fn default_targets() -> Vec<Target> {
-    [
+    let mut targets = [
         ("Discord", "https://discord.com"),
         ("YouTube", "https://www.youtube.com"),
         ("Cloudflare", "https://www.cloudflare.com"),
-        ("Cloudflare DNS", "PING:1.1.1.1"),
-        ("Google DNS", "PING:8.8.8.8"),
     ]
     .into_iter()
     .filter_map(|(name, value)| parse_target(&format!("{name} = \"{value}\"")))
-    .collect()
+    .collect::<Vec<_>>();
+
+    targets.extend(
+        PROFILE_TEST_PING_TARGETS
+            .iter()
+            .filter_map(|(_, label, address)| {
+                parse_target(&format!("{label} = \"PING:{address}\""))
+            }),
+    );
+    targets
 }
 
 fn load_dpi_targets() -> Result<Vec<Target>> {
@@ -273,6 +306,7 @@ fn load_dpi_targets() -> Result<Vec<Target>> {
 }
 
 fn start_profile(bundle_path: &Path, profile: &BundleProfile) -> Result<()> {
+    patch_profile_script(&bundle_path.join(profile.script_name()))?;
     hidden_command("cmd")
         .arg("/C")
         .arg(bundle_path.join(profile.script_name()))
@@ -423,7 +457,7 @@ fn standard_check(url: &str, protocol: &str, bundle_path: &Path) -> Result<Strin
 }
 
 fn dpi_check(host: &str, protocol: &str, bundle_path: &Path) -> Result<String> {
-    let payload = bundle_path.join("utils").join("zapret-hub-dpi-payload.bin");
+    let payload = std::env::temp_dir().join("zapret-hub-dpi-payload.bin");
     if !payload.is_file() {
         std::fs::write(&payload, pseudo_random_payload(65_536))?;
     }
@@ -500,10 +534,18 @@ fn ping(host: &str, bundle_path: &Path) -> Result<bool> {
 }
 
 fn stop_test_winws(bundle_path: &Path) {
+    if !has_process(&running_process_names(), WINWS_IMAGE) {
+        return;
+    }
     let _ = hidden_command("taskkill")
-        .args(["/IM", "winws.exe", "/T", "/F"])
+        .args(["/IM", WINWS_IMAGE, "/T", "/F"])
         .current_dir(bundle_path)
         .status();
+    let deadline = std::time::Instant::now() + WINWS_EXIT_TIMEOUT;
+    while has_process(&running_process_names(), WINWS_IMAGE) && std::time::Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn wait_with_cancellation(duration: Duration, cancelled: &AtomicBool) -> Result<()> {
@@ -576,19 +618,6 @@ fn write_report(
     Ok(path)
 }
 
-#[cfg(target_os = "windows")]
-fn hidden_command(program: &str) -> std::process::Command {
-    use std::os::windows::process::CommandExt;
-    let mut command = std::process::Command::new(program);
-    command.creation_flags(0x0800_0000);
-    command
-}
-
-#[cfg(not(target_os = "windows"))]
-fn hidden_command(program: &str) -> std::process::Command {
-    std::process::Command::new(program)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,10 +638,33 @@ mod tests {
     }
 
     #[test]
+    fn commented_targets_are_ignored() {
+        assert!(parse_target("#   KeyName = \"PING:1.2.3.4\"").is_none());
+        assert!(parse_target("  # Discord = \"https://discord.com\"").is_none());
+    }
+
+    #[test]
     fn parses_ping_target() {
         let target = parse_target("Cloudflare = \"PING:1.1.1.1\"").unwrap();
         assert!(target.ping_only);
         assert_eq!(target.value, "1.1.1.1");
+    }
+
+    #[test]
+    fn default_ping_targets_use_independent_providers() {
+        let ping_targets = default_targets()
+            .into_iter()
+            .filter(|target| target.ping_only)
+            .collect::<Vec<_>>();
+
+        assert_eq!(ping_targets.len(), PROFILE_TEST_PING_TARGETS.len());
+        for (_, label, address) in PROFILE_TEST_PING_TARGETS {
+            assert!(
+                ping_targets
+                    .iter()
+                    .any(|target| target.name == *label && target.value == *address)
+            );
+        }
     }
     #[test]
     fn ranks_standard_by_success_then_error() {

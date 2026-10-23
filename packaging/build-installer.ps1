@@ -1,7 +1,6 @@
 param(
-    [string]$BundlePath,
-    [string]$BundleTag = "1.10.0",
-    [string]$TelegramProxyTag = "v1.9.1"
+    # Empty = latest upstream release.
+    [string]$BundleTag = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -46,14 +45,7 @@ if (-not $versionLine) {
 
 $version = $versionLine.Matches[0].Groups[1].Value
 
-$stageArgs = @{}
-if ($PSBoundParameters.ContainsKey("BundlePath")) {
-    $stageArgs.BundlePath = $BundlePath
-}
-$stageArgs.BundleTag = $BundleTag
-$stageArgs.TelegramProxyTag = $TelegramProxyTag
-
-& $stageScript @stageArgs
+& $stageScript -BundleTag $BundleTag
 
 New-Item -ItemType Directory -Force -Path (Join-Path $projectRoot "dist\installer") | Out-Null
 

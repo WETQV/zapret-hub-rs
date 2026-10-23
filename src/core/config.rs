@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 const APP_DIR_NAME: &str = "Zapret Hub";
 const SETTINGS_FILE_NAME: &str = "settings.json";
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TelegramProxyMode {
     #[default]
@@ -93,6 +93,14 @@ pub(crate) struct AppConfig {
     pub(crate) startup_notifications_enabled: bool,
     #[serde(default)]
     pub(crate) last_seen_app_version: Option<String>,
+    #[serde(default = "default_true")]
+    pub(crate) close_to_tray: bool,
+    #[serde(default)]
+    pub(crate) minimize_to_tray: bool,
+    #[serde(default)]
+    pub(crate) autostart_launch_profile: bool,
+    #[serde(default = "default_true")]
+    pub(crate) stop_on_exit: bool,
 }
 
 impl Default for AppConfig {
@@ -110,6 +118,10 @@ impl Default for AppConfig {
             main_profile_script: Some(ZapretProfile::default().script_name().to_owned()),
             startup_notifications_enabled: default_startup_notifications_enabled(),
             last_seen_app_version: None,
+            close_to_tray: true,
+            minimize_to_tray: false,
+            autostart_launch_profile: false,
+            stop_on_exit: true,
         }
     }
 }
@@ -127,6 +139,10 @@ fn default_selected_tab() -> String {
 }
 
 fn default_startup_notifications_enabled() -> bool {
+    true
+}
+
+fn default_true() -> bool {
     true
 }
 
@@ -154,7 +170,11 @@ pub(crate) fn save_app_config(config: &AppConfig) -> Result<()> {
         .with_context(|| format!("failed to create {}", config_dir.display()))?;
 
     let content = serde_json::to_string_pretty(config).context("failed to serialize config")?;
-    fs::write(&config_path, content)
+    // Write-then-rename so a crash mid-save never leaves a truncated settings.json behind.
+    let temp_path = config_path.with_extension("json.tmp");
+    fs::write(&temp_path, content)
+        .with_context(|| format!("failed to write {}", temp_path.display()))?;
+    fs::rename(&temp_path, &config_path)
         .with_context(|| format!("failed to write {}", config_path.display()))
 }
 
@@ -196,5 +216,8 @@ mod tests {
             config.main_profile_script_or_legacy(),
             "general (ALT11).bat"
         );
+        assert!(config.close_to_tray);
+        assert!(config.stop_on_exit);
+        assert!(!config.minimize_to_tray);
     }
 }

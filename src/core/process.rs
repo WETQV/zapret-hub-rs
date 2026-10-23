@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use anyhow::{Context, Result};
 
@@ -14,6 +14,7 @@ pub(crate) fn run_hidden_batch_wait(script_path: &Path, current_dir: &Path) -> R
         .arg("/C")
         .arg(script_path)
         .current_dir(current_dir)
+        .env("NO_UPDATE_CHECK", "1")
         .status()
         .with_context(|| format!("failed to run {}", script_path.display()))?;
 
@@ -46,8 +47,10 @@ pub(crate) fn run_hidden_command_output(
         .with_context(|| format!("failed to run {program}"))
 }
 
+/// Opens an interactive script (service.bat menu etc.) in its own console window on purpose.
+/// The outer `cmd` stays hidden; `start` gives the script a fresh visible console.
 pub(crate) fn run_visible_batch_detached(script_path: &Path, current_dir: &Path) -> Result<()> {
-    Command::new("cmd")
+    hidden_command("cmd")
         .args(["/C", "start", "", script_path.to_string_lossy().as_ref()])
         .current_dir(current_dir)
         .spawn()
@@ -63,8 +66,11 @@ pub(crate) fn try_run_hidden_command(program: &str, args: &[&str], current_dir: 
         .status();
 }
 
-fn hidden_command(program: &str) -> Command {
+/// A console-less child process. stdin is closed so that `pause` / `set /p` in upstream
+/// batch files return immediately instead of blocking forever in an invisible console.
+pub(crate) fn hidden_command(program: &str) -> Command {
     let mut command = Command::new(program);
+    command.stdin(Stdio::null());
 
     #[cfg(target_os = "windows")]
     command.creation_flags(CREATE_NO_WINDOW);
@@ -73,8 +79,7 @@ fn hidden_command(program: &str) -> Command {
 }
 
 fn ensure_success(code: Option<i32>, target: String) -> Result<()> {
-    let success = code == Some(0);
-    if success {
+    if code == Some(0) {
         return Ok(());
     }
 
