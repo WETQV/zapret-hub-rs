@@ -4,18 +4,16 @@
 
 Этот репозиторий не реализует сам bypass-движок. Он даёт нативный GUI, упаковку, проверки статуса и более удобное управление уже существующим Windows-набором, в котором есть профили, helper-скрипты, `winws`, `WinDivert` и Telegram proxy.
 
-![Интерфейс Zapret Hub](src/screen/menu_hub.png)
+![Главная Zapret Hub](docs/screens/home.png)
 
 ## Что делает проект
 
-- запускает основной подготовленный профиль
-- запускает запасные профили из bundle
-- запускает и останавливает Telegram proxy
-- останавливает активные bypass-процессы
-- открывает оригинальный менеджер сервиса из bundle
-- применяет небольшой пресет «настроить для друзей»
-- поддерживает автозапуск приложения вместе с Windows
-- собирает приложение и bundle в обычный Windows-инсталлер
+- включает и выключает обход одной кнопкой, живёт в трее
+- запускает любой профиль `general*.bat` из bundle и подбирает лучший автоматически
+- скачивает и обновляет bundle Flowseal и Telegram WS proxy в один клик
+- управляет локальным MTProto-прокси для Telegram (порт 1443): кнопка «Открыть в Telegram» подключает его одним кликом, есть режим `CF media`
+- открывает оригинальный `service.bat` и удаляет службу `zapret`
+- запускается вместе с Windows (через Планировщик, без UAC) и может сразу включать обход
 
 ## Чего проект не делает
 
@@ -37,31 +35,32 @@ Zapret Hub/
 
 Во время работы приложение сначала ищет `bundle/` рядом с `Zapret Hub.exe`.
 
-## Текущие возможности
+## Интерфейс
 
-- нативный desktop UI на Rust с `egui` / `eframe`
-- запуск только одного экземпляра приложения
-- проверка статуса:
-  - `winws.exe`
-  - `TgWsProxy_windows.exe`
-  - Windows-сервис `zapret`
-- запуск основного профиля:
-  - `SIMPLE FAKE ALT2`
-- запуск запасных профилей:
-  - `ALT11`
-  - `FAKE TLS AUTO ALT3`
-  - `ALT7`
-- запуск Telegram proxy
-- действие «остановить всё» для известных связанных процессов
-- общий дедлайн остановки runtime в 8 секунд с понятной ошибкой, если что-то осталось активно
-- нативный поиск лучшего профиля без окна PowerShell: обычный HTTP/TLS/ping и расширенный DPI 16–20 КБ режим
-- выбор отдельных UDP fake-файлов для Discord Voice и GameFilter
-- сервисные действия:
-  - установить сервис
-  - удалить сервис
-  - открыть оригинальный `service.bat`
-- автозапуск приложения через Windows Task Scheduler
-- сборка инсталлера через Inno Setup
+Собственное окно со своими кнопками свернуть/развернуть/закрыть, плавные переходы между страницами и анимации. Тема следует настройке Windows.
+
+| Профили | Telegram |
+| --- | --- |
+| ![Профили](docs/screens/profiles.png) | ![Telegram](docs/screens/telegram.png) |
+| **Обновления** | **Настройки** |
+| ![Обновления](docs/screens/updates.png) | ![Настройки](docs/screens/settings.png) |
+
+## Возможности
+
+- нативный интерфейс на Rust (`egui` / `eframe` 0.37), светлая и тёмная тема по настройке Windows
+- собственная шапка окна и анимации; иконка в трее с меню, сворачивание в трей при закрытии, единственный экземпляр приложения
+- статус `winws.exe`, `TgWsProxy_windows.exe` и службы `zapret` напрямую через WinAPI, без запуска консольных утилит
+- все служебные процессы запускаются скрыто, `winws.exe` из профилей 1.10.x тоже не оставляет окон
+- подбор лучшего профиля без PowerShell: обычный HTTP/TLS/ping и глубокий режим DPI 16–20 КБ
+- обновление bundle: скачать → остановить обход → заменить → запустить снова; пользовательские списки и fake-файлы сохраняются
+- выбор UDP fake-файлов для Discord Voice и GameFilter
+- сборка под Windows с Linux, портативный архив и установщик Inno Setup
+
+## Telegram
+
+Telegram WS proxy (Flowseal) — это локальный **MTProto**-прокси на `127.0.0.1:1443`. На странице «Telegram» включите «Запускать вместе с профилем», включите обход и нажмите «Открыть в Telegram» (или «Скопировать ссылку» и откройте её в Telegram). Прокси добавится один раз, дальше всё работает само. Секрет прокси создаёт он сам при первом запуске и хранится в `%APPDATA%\TgWsProxy\config.json`.
+
+Zapret Hub меняет в этом файле только свои ключи (порт, список DC, режим CF), остальные настройки прокси не трогает.
 
 ## Telegram CF media
 
@@ -87,75 +86,63 @@ The preset intentionally does not add broad Cloudflare, AWS, or Photon IP ranges
 ## Структура репозитория
 
 ```text
-zapret-hub-rs/
-  src/
-    main.rs
-    app.rs
-    core/
-      autostart.rs
-      build_info.rs
-      config.rs
-      paths.rs
-      process.rs
-      status.rs
-    zapret/
-      bundle.rs
-    screen/
-      menu_hub.png
-  installer/
-    zapret-hub.iss
-  packaging/
-    build-installer.ps1
-    stage-release.ps1
-    generate-update-manifest.ps1
-  docs/
-    ARCHITECTURE.md
-    RELEASE.md
-    TELEGRAM_CF_MEDIA.md
+src/
+  main.rs            запуск, единственный экземпляр, CLI --stage-bundle
+  platform.rs        Win32: мьютекс, сигнал «показать окно», MessageBox
+  tray.rs            иконка и меню в трее
+  app/
+    mod.rs           состояние, фоновые задачи, логика окна и трея
+    views.rs         страницы интерфейса
+    theme.rs         цвета, стили и собственные виджеты
+  core/
+    bundle_update.rs скачивание и установка bundle
+    github.rs        релизы GitHub, загрузка с прогрессом, SHA-256
+    profile_test.rs  подбор профиля
+    status.rs        процессы и службы через WinAPI
+    ...
+  zapret/
+    bundle.rs        запуск и остановка профилей, Telegram proxy, списки
+    fakes.rs         UDP fake-файлы
+packaging/
+  build-windows.sh   сборка под Windows с Linux + портативный zip
+  build-installer.ps1, stage-release.ps1   сборка установщика на Windows
+installer/zapret-hub.iss
 ```
 
-## Что нужно для сборки
+## Сборка под Windows с Linux (Ubuntu)
 
-- Windows
-- Rust `1.94+`
-- Inno Setup 6
+Один раз:
 
-## Локальная сборка
-
-```powershell
-cargo build
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # Rust 1.95+
+rustup target add x86_64-pc-windows-gnu
+sudo apt install mingw-w64
 ```
 
-## Release-сборка
+Сборка:
 
-```powershell
-cargo build --release
-```
-
-## Сборка инсталлера
-
-Если использовать bundle по умолчанию:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\packaging\build-installer.ps1
-```
-
-По умолчанию release-скрипт фиксирует Flowseal `1.10.0` и TG WS Proxy `v1.9.1`. При необходимости их можно указать явно:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\packaging\build-installer.ps1 -BundleTag 1.10.0 -TelegramProxyTag v1.9.1
-```
-
-Если использовать свой путь к bundle:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\packaging\build-installer.ps1 -BundlePath "D:\some\bundle"
+```bash
+packaging/build-windows.sh                  # последний bundle Flowseal
+BUNDLE_TAG=1.10.4 packaging/build-windows.sh  # закрепить версию bundle
 ```
 
 Результат:
 
-- инсталлер: `dist\installer\zapret-hub-setup-<version>.exe`
-- manifest: `dist\installer\latest.json`
+- `dist/stage/Zapret Hub.exe` и рядом `dist/stage/bundle/`
+- `dist/portable/zapret-hub-<версия>-portable.zip` — распаковать и запустить, установка не нужна
+
+Тесты и проверки запускаются на Linux как обычно: `cargo test`, `cargo clippy --target x86_64-pc-windows-gnu`. Тест полного цикла обновления против живого GitHub: `cargo test -- --ignored`.
+
+## Сборка установщика на Windows
+
+Нужны Rust и Inno Setup 6/7:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\packaging\build-installer.ps1                 # последний bundle
+powershell -ExecutionPolicy Bypass -File .\packaging\build-installer.ps1 -BundleTag 1.10.4
+```
+
+Результат: `dist\installer\zapret-hub-setup-<версия>.exe` и `dist\installer\latest.json`.
 
 ## Установка и обновления
 

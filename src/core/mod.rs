@@ -3,6 +3,7 @@ pub(crate) mod build_info;
 pub(crate) mod bundle_metadata;
 pub(crate) mod bundle_update;
 pub(crate) mod config;
+pub(crate) mod github;
 pub(crate) mod paths;
 pub(crate) mod process;
 pub(crate) mod profile_test;

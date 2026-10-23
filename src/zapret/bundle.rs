@@ -5,14 +5,17 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
-use serde::{Deserialize, Serialize};
 
+use crate::core::bundle_update::patch_profile_script;
 use crate::core::config::TelegramProxyMode;
 use crate::core::process::{
-    run_hidden_batch_wait, run_hidden_command_output, run_hidden_command_wait,
-    run_visible_batch_detached, try_run_hidden_command,
+    run_hidden_batch_wait, run_hidden_command_wait, run_visible_batch_detached,
+    try_run_hidden_command,
 };
-use crate::core::status::ServiceState;
+use crate::core::status::{
+    TG_PROXY_IMAGE, WINDIVERT_SERVICES, WINWS_IMAGE, ZAPRET_SERVICE, has_process,
+    query_service_state, running_process_names,
+};
 
 const MANAGED_WHITELIST_START: &str = "# Zapret Hub managed whitelist start";
 const MANAGED_WHITELIST_END: &str = "# Zapret Hub managed whitelist end";
@@ -38,12 +41,12 @@ const TELEGRAM_PROXY_SILENT_SCRIPT_NAME: &str = "start_telegram_proxy_silent.cmd
 pub(crate) const TELEGRAM_PROXY_LOG_FILE_NAME: &str = "tgproxy-runtime.log";
 pub(crate) const TELEGRAM_PROXY_LAUNCH_LOG_FILE_NAME: &str = "tgproxy-launch.log";
 const STOP_RUNTIME_TIMEOUT: Duration = Duration::from_secs(8);
-const TELEGRAM_PROXY_STANDARD_ARGS: &str =
-    "--dc-ip 2:149.154.167.220 --dc-ip 4:149.154.167.220 --dc-ip 203:149.154.167.220";
+const WINWS_START_TIMEOUT: Duration = Duration::from_secs(4);
+const TELEGRAM_PROXY_STANDARD_ARGS: &str = "--dc-ip 2:149.154.167.220 --dc-ip 4:149.154.167.220";
 const TELEGRAM_PROXY_CF_MEDIA_ARGS_PREFIX: &str = "--dc-ip 4:149.154.167.220 --cfproxy-domain ";
 const TELEGRAM_PROXY_CONFIG_DIR_NAME: &str = "TgWsProxy";
 const TELEGRAM_PROXY_CONFIG_FILE_NAME: &str = "config.json";
-const TELEGRAM_PROXY_DEFAULT_SECRET: &str = "6c3c7e85fc245242b3d113cfe307b520";
+const TELEGRAM_PROXY_PORT: u16 = 1443;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BundleProfile {
@@ -77,23 +80,6 @@ pub(crate) struct TelegramProxyLaunchConfig {
     pub(crate) cf_domain: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct TelegramProxyAppDataConfig {
-    port: u16,
-    host: String,
-    dc_ip: Vec<String>,
-    verbose: bool,
-    autostart: bool,
-    log_max_mb: u32,
-    buf_kb: u32,
-    pool_size: u32,
-    check_updates: bool,
-    cfproxy: bool,
-    cfproxy_priority: bool,
-    cfproxy_domain: String,
-    secret: String,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BundleAction {
     StartProfile {
@@ -102,32 +88,20 @@ pub(crate) enum BundleAction {
     },
     StopAll,
     RefreshIpset,
-    InstallService,
     RemoveService,
     OpenServiceManager,
 }
 
 impl BundleAction {
-    fn label(&self) -> String {
+    fn done_message(&self) -> String {
         match self {
-            Self::StartProfile {
-                profile,
-                use_builtin_whitelist,
-            } => {
-                if *use_builtin_whitelist {
-                    format!(
-                        "{} profile started with whitelist and VRChat preset",
-                        profile.label()
-                    )
-                } else {
-                    format!("{} profile started with VRChat preset", profile.label())
-                }
+            Self::StartProfile { profile, .. } => format!("Профиль {} запущен.", profile.label()),
+            Self::StopAll => "Обход остановлен.".to_owned(),
+            Self::RefreshIpset => "ipset восстановлен из ipset-all.txt.backup.".to_owned(),
+            Self::RemoveService => "Служба zapret удалена, WinDivert выгружен.".to_owned(),
+            Self::OpenServiceManager => {
+                "service.bat открыт в отдельном окне — завершите действие там.".to_owned()
             }
-            Self::StopAll => "bypass, proxy and services stopped".to_owned(),
-            Self::RefreshIpset => "ipset list refreshed from bundled backup".to_owned(),
-            Self::InstallService => "service installer launched".to_owned(),
-            Self::RemoveService => "service removal completed".to_owned(),
-            Self::OpenServiceManager => "service manager opened".to_owned(),
         }
     }
 }
@@ -137,7 +111,7 @@ pub(crate) fn run_action(
     action: BundleAction,
     telegram_proxy: &TelegramProxyLaunchConfig,
 ) -> Result<String> {
-    let label = action.label();
+    let message = action.done_message();
 
     match action {
         BundleAction::StartProfile {
@@ -149,14 +123,11 @@ pub(crate) fn run_action(
         }
         BundleAction::StopAll => stop_runtime(bundle_path)?,
         BundleAction::RefreshIpset => refresh_ipset_from_backup(bundle_path)?,
-        BundleAction::InstallService => {
-            launch_visible_script(bundle_path, "install_service_simple_fake_alt2.cmd")?
-        }
         BundleAction::RemoveService => remove_service(bundle_path)?,
         BundleAction::OpenServiceManager => launch_visible_root_script(bundle_path, "service.bat")?,
     }
 
-    Ok(label)
+    Ok(message)
 }
 
 pub(crate) fn discover_profiles(bundle_path: &Path) -> Result<Vec<BundleProfile>> {
@@ -182,15 +153,6 @@ pub(crate) fn discover_profiles(bundle_path: &Path) -> Result<Vec<BundleProfile>
         natural_sort_key(left.script_name()).cmp(&natural_sort_key(right.script_name()))
     });
     Ok(profiles)
-}
-
-pub(crate) fn find_profile_by_script(
-    bundle_path: &Path,
-    script_name: &str,
-) -> Result<Option<BundleProfile>> {
-    Ok(discover_profiles(bundle_path)?
-        .into_iter()
-        .find(|profile| profile.script_name().eq_ignore_ascii_case(script_name)))
 }
 
 fn is_profile_script_name(script_name: &str) -> bool {
@@ -263,6 +225,7 @@ fn start_profile(
         ));
     }
 
+    patch_profile_script(&profile_path)?;
     sync_vrchat_hostlist(bundle_path)?;
     sync_cf_media_hostlist(bundle_path, telegram_proxy)?;
 
@@ -274,10 +237,11 @@ fn start_profile(
     }
 
     run_hidden_batch_wait(&profile_path, bundle_path)?;
+    ensure_winws_started(bundle_path)?;
 
     if telegram_proxy.enabled {
         thread::sleep(Duration::from_secs(2));
-        run_hidden_script(bundle_path, "telegram_proxy.cmd")?;
+        run_hidden_script(bundle_path, TELEGRAM_PROXY_SCRIPT_NAME)?;
     }
 
     Ok(())
@@ -348,63 +312,78 @@ fn sync_telegram_proxy_appdata_config(telegram_proxy: &TelegramProxyLaunchConfig
         .ok_or_else(|| anyhow!("telegram proxy config directory not found"))?;
     fs::create_dir_all(config_dir)?;
 
-    let existing = fs::read_to_string(&config_path)
-        .ok()
-        .and_then(|content| serde_json::from_str::<TelegramProxyAppDataConfig>(&content).ok());
+    let existing = fs::read_to_string(&config_path).ok().and_then(|content| {
+        serde_json::from_str::<serde_json::Value>(content.trim_start_matches('\u{feff}')).ok()
+    });
 
-    let config = telegram_proxy_appdata_config(telegram_proxy, existing.as_ref());
+    let config = telegram_proxy_appdata_config(telegram_proxy, existing);
     let serialized = serde_json::to_string_pretty(&config)?;
     fs::write(config_path, format!("{serialized}\n"))?;
 
     Ok(())
 }
 
+/// The proxy is an MTProto server on 127.0.0.1:1443 whose settings live in `config.json`.
+/// Only the keys Zapret Hub owns are overwritten; everything else (secret, buffers, language,
+/// worker domains, …) is kept, and an absent secret is generated by the proxy on first start.
 fn telegram_proxy_appdata_config(
     telegram_proxy: &TelegramProxyLaunchConfig,
-    existing: Option<&TelegramProxyAppDataConfig>,
-) -> TelegramProxyAppDataConfig {
-    let secret = existing
-        .map(|config| config.secret.trim())
-        .filter(|secret| !secret.is_empty())
-        .unwrap_or(TELEGRAM_PROXY_DEFAULT_SECRET)
-        .to_owned();
+    existing: Option<serde_json::Value>,
+) -> serde_json::Value {
+    use serde_json::{Value, json};
 
-    match telegram_proxy.mode {
-        TelegramProxyMode::Standard => TelegramProxyAppDataConfig {
-            port: 1080,
-            host: "127.0.0.1".to_owned(),
-            dc_ip: vec![
-                "2:149.154.167.220".to_owned(),
-                "4:149.154.167.220".to_owned(),
-                "203:149.154.167.220".to_owned(),
-            ],
-            verbose: false,
-            autostart: false,
-            log_max_mb: existing.as_ref().map_or(5, |config| config.log_max_mb),
-            buf_kb: existing.as_ref().map_or(256, |config| config.buf_kb),
-            pool_size: existing.as_ref().map_or(4, |config| config.pool_size),
-            check_updates: false,
-            cfproxy: false,
-            cfproxy_priority: false,
-            cfproxy_domain: String::new(),
-            secret,
-        },
-        TelegramProxyMode::CfMedia => TelegramProxyAppDataConfig {
-            port: 1080,
-            host: "127.0.0.1".to_owned(),
-            dc_ip: vec!["4:149.154.167.220".to_owned()],
-            verbose: false,
-            autostart: false,
-            log_max_mb: existing.as_ref().map_or(5, |config| config.log_max_mb),
-            buf_kb: existing.as_ref().map_or(256, |config| config.buf_kb),
-            pool_size: existing.as_ref().map_or(4, |config| config.pool_size),
-            check_updates: false,
-            cfproxy: true,
-            cfproxy_priority: true,
-            cfproxy_domain: telegram_proxy.cf_domain.trim().to_owned(),
-            secret,
-        },
+    let mut config = match existing {
+        Some(Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    let (dc_ip, user_domain) = match telegram_proxy.mode {
+        TelegramProxyMode::Standard => (vec!["2:149.154.167.220", "4:149.154.167.220"], Vec::new()),
+        // Media-only DC4 through the user's own Cloudflare domain.
+        TelegramProxyMode::CfMedia => (
+            vec!["4:149.154.167.220"],
+            vec![telegram_proxy.cf_domain.trim().to_owned()],
+        ),
+    };
+    let cf_media = telegram_proxy.mode == TelegramProxyMode::CfMedia;
+
+    config.insert("host".into(), json!("127.0.0.1"));
+    config.insert("port".into(), json!(TELEGRAM_PROXY_PORT));
+    config.insert("dc_ip".into(), json!(dc_ip));
+    config.insert("check_updates".into(), json!(false));
+    config.insert("autostart".into(), json!(false));
+    config.insert("cfproxy".into(), json!(true));
+    config.insert("cfproxy_user_domain_enabled".into(), json!(cf_media));
+    config.insert("cfproxy_user_domain".into(), json!(user_domain));
+    // Stale keys of the pre-MTProto config format.
+    for stale in ["cfproxy_domain", "cfproxy_priority"] {
+        config.remove(stale);
     }
+    if config
+        .get("secret")
+        .and_then(Value::as_str)
+        .is_none_or(|secret| secret.trim().len() != 32)
+    {
+        config.remove("secret");
+    }
+    Value::Object(config)
+}
+
+/// `tg://proxy` link for Telegram Desktop, once the proxy has generated its secret.
+pub(crate) fn telegram_proxy_link() -> Option<String> {
+    let content = fs::read_to_string(telegram_proxy_appdata_config_path().ok()?).ok()?;
+    let config: serde_json::Value =
+        serde_json::from_str(content.trim_start_matches('\u{feff}')).ok()?;
+    let secret = config.get("secret")?.as_str()?.trim();
+    if secret.len() != 32 || !secret.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    let port = config
+        .get("port")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(u64::from(TELEGRAM_PROXY_PORT));
+    Some(format!(
+        "tg://proxy?server=127.0.0.1&port={port}&secret=dd{secret}"
+    ))
 }
 
 fn telegram_proxy_appdata_config_path() -> Result<PathBuf> {
@@ -459,7 +438,7 @@ tasklist /FI \"IMAGENAME eq TgWsProxy_windows.exe\" | find /I \"TgWsProxy_window
 if errorlevel 1 (\r\n\
     call :log launch requested\r\n\
     start \"\" /B \"%ROOT%\\TgWsProxy_windows.exe\" %TG_PROXY_ARGS% -v --log-file \"%TG_PROXY_LOG%\"\r\n\
-    timeout /t 2 > nul\r\n\
+    ping -n 3 127.0.0.1 > nul\r\n\
     tasklist /FI \"IMAGENAME eq TgWsProxy_windows.exe\" | find /I \"TgWsProxy_windows.exe\" > nul\r\n\
     if errorlevel 1 (\r\n\
         call :log process missing after launch\r\n\
@@ -486,6 +465,28 @@ cd /d \"%~dp0\"\r\n\
 start \"\" /min \"%~dp0telegram_proxy.cmd\"\r\n"
 }
 
+/// Stops only the Telegram proxy (e.g. to replace its executable). Returns whether it was running.
+pub(crate) fn stop_telegram_proxy(bundle_path: &Path) -> bool {
+    if !has_process(&running_process_names(), TG_PROXY_IMAGE) {
+        return false;
+    }
+    try_run_hidden_command(
+        "taskkill",
+        &["/IM", TG_PROXY_IMAGE, "/T", "/F"],
+        bundle_path,
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while has_process(&running_process_names(), TG_PROXY_IMAGE) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
+    }
+    true
+}
+
+/// Starts the proxy again with the arguments of the last profile launch.
+pub(crate) fn restart_telegram_proxy(bundle_path: &Path) -> Result<()> {
+    run_hidden_script(bundle_path, TELEGRAM_PROXY_SCRIPT_NAME)
+}
+
 fn run_hidden_script(bundle_path: &Path, script_name: &str) -> Result<()> {
     let script_path = hub_script_path(bundle_path, script_name);
     if !script_path.is_file() {
@@ -498,22 +499,44 @@ fn run_hidden_script(bundle_path: &Path, script_name: &str) -> Result<()> {
     run_hidden_batch_wait(&script_path, bundle_path)
 }
 
-fn stop_runtime(bundle_path: &Path) -> Result<()> {
+/// The profile .bat only spawns winws.exe and exits, so give it a moment to actually appear.
+fn ensure_winws_started(bundle_path: &Path) -> Result<()> {
+    let deadline = Instant::now() + WINWS_START_TIMEOUT;
+    while Instant::now() < deadline {
+        if has_process(&running_process_names(), WINWS_IMAGE) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    let service_running = query_service_state(ZAPRET_SERVICE).is_active();
+    Err(anyhow!(if service_running {
+        "winws.exe не запустился: уже работает служба zapret. Удалите её в «Настройки → Служба»."
+            .to_owned()
+    } else {
+        format!(
+            "winws.exe не запустился. Проверьте, что антивирус не удалил {}",
+            bundle_path.join("bin").join(WINWS_IMAGE).display()
+        )
+    }))
+}
+
+pub(crate) fn stop_runtime(bundle_path: &Path) -> Result<()> {
     request_runtime_stop(bundle_path);
     let deadline = Instant::now() + STOP_RUNTIME_TIMEOUT;
     let mut retried = false;
-    let mut remaining = remaining_runtime_items(bundle_path);
+    let mut remaining = remaining_runtime_items();
     while !remaining.is_empty() && Instant::now() < deadline {
         if !retried && Instant::now() + Duration::from_secs(4) >= deadline {
             request_runtime_stop(bundle_path);
             retried = true;
         }
         thread::sleep(Duration::from_millis(250));
-        remaining = remaining_runtime_items(bundle_path);
+        remaining = remaining_runtime_items();
     }
     if !remaining.is_empty() {
         return Err(anyhow!(
-            "не удалось остановить runtime за 8 секунд: {}",
+            "не удалось остановить за 8 секунд: {}",
             remaining.join("; ")
         ));
     }
@@ -522,100 +545,47 @@ fn stop_runtime(bundle_path: &Path) -> Result<()> {
 }
 
 fn request_runtime_stop(bundle_path: &Path) {
-    for service_name in ["zapret", "WinDivert", "WinDivert14"] {
-        try_run_hidden_command("sc", &["stop", service_name], bundle_path);
+    try_run_hidden_command("sc", &["stop", ZAPRET_SERVICE], bundle_path);
+    let processes = running_process_names();
+    for image_name in [WINWS_IMAGE, TG_PROXY_IMAGE] {
+        if has_process(&processes, image_name) {
+            try_run_hidden_command("taskkill", &["/IM", image_name, "/T", "/F"], bundle_path);
+        }
     }
-    for image_name in ["winws.exe", "TgWsProxy_windows.exe"] {
-        try_run_hidden_command("taskkill", &["/IM", image_name, "/T", "/F"], bundle_path);
+    // Unloads the driver so bin\WinDivert64.sys is no longer locked (needed for bundle updates).
+    for service_name in WINDIVERT_SERVICES {
+        if query_service_state(service_name).is_active() {
+            try_run_hidden_command("sc", &["stop", service_name], bundle_path);
+        }
     }
 }
 
 fn remove_service(bundle_path: &Path) -> Result<()> {
     stop_runtime(bundle_path)?;
-    delete_service_if_present(bundle_path, "zapret");
-    delete_service_if_present(bundle_path, "WinDivert");
-    delete_service_if_present(bundle_path, "WinDivert14");
+    for service_name in [ZAPRET_SERVICE, WINDIVERT_SERVICES[0], WINDIVERT_SERVICES[1]] {
+        let _ = run_hidden_command_wait("sc", &["delete", service_name], bundle_path);
+    }
 
     Ok(())
 }
 
-fn delete_service_if_present(bundle_path: &Path, service_name: &str) {
-    let _ = run_hidden_command_wait("sc", &["delete", service_name], bundle_path);
-}
-
-fn remaining_runtime_items(bundle_path: &Path) -> Vec<String> {
+fn remaining_runtime_items() -> Vec<String> {
     let mut remaining = Vec::new();
 
-    for service_name in ["zapret", "WinDivert", "WinDivert14"] {
-        match query_service_state(bundle_path, service_name) {
-            Ok(Some(ServiceState::Running | ServiceState::StopPending | ServiceState::Unknown)) => {
-                remaining.push(format!("service {service_name} is still active"));
-            }
-            Ok(Some(ServiceState::Stopped | ServiceState::NotInstalled)) | Ok(None) => {}
-            Err(error) => remaining.push(format!("service {service_name} check failed: {error}")),
+    for service_name in [ZAPRET_SERVICE, WINDIVERT_SERVICES[0], WINDIVERT_SERVICES[1]] {
+        if query_service_state(service_name).is_active() {
+            remaining.push(format!("служба {service_name}"));
         }
     }
 
-    let process_output = run_hidden_command_output("tasklist", &[], bundle_path)
-        .map(|output| output.stdout)
-        .unwrap_or_default();
-    for image_name in ["winws.exe", "TgWsProxy_windows.exe"] {
-        if tasklist_output_has_process(&process_output, image_name) {
-            remaining.push(format!("process {image_name} is still running"));
+    let processes = running_process_names();
+    for image_name in [WINWS_IMAGE, TG_PROXY_IMAGE] {
+        if has_process(&processes, image_name) {
+            remaining.push(format!("процесс {image_name}"));
         }
     }
 
     remaining
-}
-
-fn tasklist_output_has_process(output: &[u8], image_name: &str) -> bool {
-    String::from_utf8_lossy(output)
-        .to_ascii_lowercase()
-        .contains(&image_name.to_ascii_lowercase())
-}
-
-fn query_service_state(bundle_path: &Path, service_name: &str) -> Result<Option<ServiceState>> {
-    let output = run_hidden_command_output("sc", &["query", service_name], bundle_path)?;
-    let text = String::from_utf8_lossy(&output.stdout).to_ascii_uppercase();
-    let error = String::from_utf8_lossy(&output.stderr).to_ascii_uppercase();
-
-    if text.contains("FAILED 1060")
-        || text.contains("DOES NOT EXIST")
-        || error.contains("FAILED 1060")
-        || error.contains("DOES NOT EXIST")
-    {
-        return Ok(Some(ServiceState::NotInstalled));
-    }
-
-    if !output.status.success() && text.is_empty() && error.is_empty() {
-        return Ok(None);
-    }
-
-    if text.contains("RUNNING") {
-        return Ok(Some(ServiceState::Running));
-    }
-
-    if text.contains("STOP_PENDING") {
-        return Ok(Some(ServiceState::StopPending));
-    }
-
-    if text.contains("STOPPED") {
-        return Ok(Some(ServiceState::Stopped));
-    }
-
-    Ok(Some(ServiceState::Unknown))
-}
-
-fn launch_visible_script(bundle_path: &Path, script_name: &str) -> Result<()> {
-    let script_path = hub_script_path(bundle_path, script_name);
-    if !script_path.is_file() {
-        return Err(anyhow!(
-            "helper script not found: {}",
-            script_path.display()
-        ));
-    }
-
-    run_visible_batch_detached(&script_path, bundle_path)
 }
 
 fn launch_visible_root_script(bundle_path: &Path, script_name: &str) -> Result<()> {
@@ -860,62 +830,54 @@ mod tests {
     }
 
     #[test]
-    fn tasklist_output_detects_running_process_by_image_name() {
-        let output =
-            b"Image Name                     PID Session Name        Session#    Mem Usage\r\n\
-winws.exe                    1234 Console                    1      1,024 K\r\n";
-
-        assert!(tasklist_output_has_process(output, "winws.exe"));
-        assert!(!tasklist_output_has_process(
-            output,
-            "TgWsProxy_windows.exe"
-        ));
-    }
-
-    #[test]
     fn runtime_stop_uses_one_eight_second_deadline() {
         assert_eq!(STOP_RUNTIME_TIMEOUT, Duration::from_secs(8));
     }
 
     #[test]
-    fn telegram_proxy_appdata_config_disables_proxy_update_checks() {
-        let existing = TelegramProxyAppDataConfig {
-            port: 1080,
-            host: "127.0.0.1".to_owned(),
-            dc_ip: vec!["2:149.154.167.220".to_owned()],
-            verbose: true,
-            autostart: true,
-            log_max_mb: 12,
-            buf_kb: 512,
-            pool_size: 8,
-            check_updates: true,
-            cfproxy: false,
-            cfproxy_priority: false,
-            cfproxy_domain: String::new(),
-            secret: "custom-secret".to_owned(),
-        };
-
+    fn telegram_proxy_config_uses_mtproto_schema_and_keeps_user_keys() {
+        let existing = serde_json::json!({
+            "port": 1080, "secret": "6c3c7e85fc245242b3d113cfe307b520",
+            "check_updates": true, "language": "ru", "cfproxy_domain": "old.example"
+        });
         let standard = telegram_proxy_appdata_config(
             &TelegramProxyLaunchConfig {
                 enabled: true,
                 mode: TelegramProxyMode::Standard,
                 cf_domain: String::new(),
             },
-            Some(&existing),
+            Some(existing.clone()),
         );
-        let cf_media = telegram_proxy_appdata_config(
+        let cf = telegram_proxy_appdata_config(
             &TelegramProxyLaunchConfig {
                 enabled: true,
                 mode: TelegramProxyMode::CfMedia,
-                cf_domain: "example.test".to_owned(),
+                cf_domain: " media.example ".to_owned(),
             },
-            Some(&existing),
+            Some(existing),
         );
+        assert_eq!(standard["port"], 1443);
+        assert_eq!(standard["check_updates"], false);
+        assert_eq!(standard["language"], "ru");
+        assert_eq!(standard["secret"], "6c3c7e85fc245242b3d113cfe307b520");
+        assert_eq!(standard["cfproxy_user_domain_enabled"], false);
+        assert!(standard.get("cfproxy_domain").is_none());
+        assert_eq!(cf["cfproxy_user_domain_enabled"], true);
+        assert_eq!(cf["cfproxy_user_domain"][0], "media.example");
+        assert_eq!(cf["dc_ip"].as_array().unwrap().len(), 1);
+    }
 
-        assert!(!standard.check_updates);
-        assert!(!cf_media.check_updates);
-        assert_eq!(standard.secret, "custom-secret");
-        assert_eq!(cf_media.secret, "custom-secret");
+    #[test]
+    fn invalid_secret_is_dropped_so_the_proxy_generates_one() {
+        let config = telegram_proxy_appdata_config(
+            &TelegramProxyLaunchConfig {
+                enabled: true,
+                mode: TelegramProxyMode::Standard,
+                cf_domain: String::new(),
+            },
+            Some(serde_json::json!({"secret": "short"})),
+        );
+        assert!(config.get("secret").is_none());
     }
 
     #[test]

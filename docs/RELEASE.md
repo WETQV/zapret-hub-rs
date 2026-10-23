@@ -13,24 +13,30 @@ Zapret Hub/
 
 The application first looks for `bundle/` next to the installed executable.
 
-## Build the installer
+## Build
 
-Run:
+On Linux (cross-compiled, produces the staged app and a portable zip):
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\packaging\build-installer.ps1 -BundleTag 1.10.0 -TelegramProxyTag v1.9.1
+```bash
+packaging/build-windows.sh                    # latest upstream bundle
+BUNDLE_TAG=1.10.4 packaging/build-windows.sh  # pinned bundle
 ```
 
-Optional custom bundle source:
+On Windows (adds the Inno Setup installer):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\packaging\build-installer.ps1 -BundlePath "D:\some\bundle"
+powershell -ExecutionPolicy Bypass -File .\packaging\build-installer.ps1 -BundleTag 1.10.4
 ```
+
+Both scripts prepare `bundle/` with `zapret-hub-rs --stage-bundle <dir> [--bundle-tag <tag>]`,
+the same code path as the in-app updater, so the shipped bundle and an updated bundle are
+always patched identically.
 
 Results:
 
-- installer: `dist\installer\zapret-hub-setup-<version>.exe`
-- update manifest: `dist\installer\latest.json`
+- staged app: `dist/stage/` (`Zapret Hub.exe`, `builtin-whitelist.txt`, `bundle/`)
+- portable zip: `dist/portable/zapret-hub-<version>-portable.zip`
+- installer: `dist\installer\zapret-hub-setup-<version>.exe` and `dist\installer\latest.json`
 
 ## Update model
 

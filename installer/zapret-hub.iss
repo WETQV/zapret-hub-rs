@@ -177,6 +177,8 @@ end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
-  if CurUninstallStep = usUninstall then
+  if CurUninstallStep = usUninstall then begin
     StopZapretRuntime();
+    ExecQuiet('schtasks /Delete /TN "Zapret Hub Autostart" /F');
+  end;
 end;
