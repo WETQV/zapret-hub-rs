@@ -1,0 +1,87 @@
+name: Build release packages
+
+# Push a tag (git tag v0.2.1 && git push origin v0.2.1) or run manually.
+# Builds the Windows installer and portable zip and uploads them to the release,
+# creating it from docs/RELEASE_NOTES_<version>.md when it does not exist yet.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (must match the version in Cargo.toml, e.g. v0.2.1)
+        required: true
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows installer and portable zip
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve release tag and check version
+        shell: bash
+        run: |
+          TAG="${{ inputs.tag }}"
+          [ -n "$TAG" ] || TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          CARGO_VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "$VERSION" != "$CARGO_VERSION" ]; then
+            echo "Tag $TAG does not match Cargo.toml version $CARGO_VERSION" >&2
+            exit 1
+          fi
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      # Builds the exe, prepares the latest upstream bundle with the app itself (--stage-bundle),
+      # compiles the installer and writes dist\installer\latest.json.
+      - name: Build installer
+        shell: pwsh
+        run: ./packaging/build-installer.ps1
+
+      - name: Pack portable zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/portable | Out-Null
+          $stage = "dist/portable/Zapret Hub"
+          Copy-Item dist/stage $stage -Recurse
+          Compress-Archive -Path $stage -DestinationPath "dist/portable/zapret-hub-$env:VERSION-portable.zip" -Force
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zapret-hub-windows
+          path: |
+            dist/installer/*.exe
+            dist/portable/*.zip
+
+      - name: Upload to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            NOTES="docs/RELEASE_NOTES_${VERSION}.md"
+            [ -f "$NOTES" ] || { echo "Release notes for $VERSION" > "$NOTES"; }
+            gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" --title "Zapret Hub $VERSION" --notes-file "$NOTES"
+          fi
+          gh release upload "$RELEASE_TAG" dist/installer/*.exe dist/installer/latest.json dist/portable/*.zip --clobber
